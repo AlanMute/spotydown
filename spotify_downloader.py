@@ -22,6 +22,12 @@ from selenium.webdriver.chrome.options import Options
 import undetected_chromedriver as uc
 import tempfile
 import shutil
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt, IntPrompt, Confirm
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.theme import Theme
 
 # Настройки Spotify API
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
@@ -29,6 +35,21 @@ CLIENT_SECRET = '942b953998a4486f91febf938aa06989'
 
 # Глобальная переменная для отладки
 DEBUG = False
+
+THEME = Theme({
+    "ok": "bold green",
+    "warn": "bold yellow",
+    "err": "bold red",
+    "title": "bold cyan",
+    "muted": "dim",
+})
+console = Console(theme=THEME)
+
+# настройка «по умолчанию» — можно менять через меню
+CLI_SETTINGS = {
+    "threads": 3,
+    "debug": False,
+}
 
 # Кэш для уже найденных треков
 SEARCH_CACHE = {}
@@ -520,120 +541,209 @@ def process_track(args):
         return f"{track['artist']} - {track['title']} (ошибка загрузки)"
 
 def main():
-    global COOKIES_NEED_REFRESH
-    
-    parser = argparse.ArgumentParser(description='Скачивание плейлистов Spotify')
-    parser.add_argument('--cookies', help='Путь к файлу cookies YouTube для обхода ограничений', default=None)
-    parser.add_argument('--debug', help='Включить подробное логирование', action='store_true')
-    parser.add_argument('--threads', type=int, default=3, help='Количество потоков для загрузки (по умолчанию: 3)')
-    parser.add_argument('--no-cookies', help='Не использовать куки даже если они есть', action='store_true')
-    parser.add_argument('--max-retries', type=int, default=2, help='Максимальное количество попыток для треков с возрастными ограничениями (по умолчанию: 2)')
-    args = parser.parse_args()
-    
-    global DEBUG
-    DEBUG = args.debug
-    
-    # Автоматически ищем cookies.txt в текущей директории
+    # стартовая авто-подхват cookies.txt (как у тебя)
     cookies_file = None
-    if not args.no_cookies:
-        cookies_file = args.cookies
-        if cookies_file is None and os.path.exists('cookies.txt'):
+    if not CLI_SETTINGS.get("no_cookies", False):
+        if os.path.exists('cookies.txt'):
             cookies_file = 'cookies.txt'
-            print("Найден файл cookies.txt в текущей директории.")
-            
-            # Проверяем валидность куки
+            console.print("[muted]Найден cookies.txt[/muted]")
             if not check_cookies_validity(cookies_file):
-                print("Файл cookies.txt недействителен или устарел.")
-                if refresh_cookies():
-                    cookies_file = 'cookies.txt'
-                else:
-                    cookies_file = None
-    
-    print("Spotify Playlist Downloader")
-    playlist_url = input("Введите URL плейлиста: ").strip()
-    
-    print("Получение информации о плейлисте...")
+                console.print("[warn]cookies.txt недействителен или устарел[/warn]")
+                # не заставляем сразу обновлять — можно из меню
+
+    # основной цикл
+    while True:
+        console.clear()
+        print_banner()
+        choice = show_main_menu()
+
+        if choice == 1:
+            cli_download_playlist(cookies_file)
+            wait_enter()
+        elif choice == 2:
+            ok = automated_cookies_refresh()
+            if ok:
+                cookies_file = "cookies.txt"
+            wait_enter()
+        elif choice == 3:
+            cli_check_cookies()
+            wait_enter()
+        elif choice == 4:
+            cli_settings()
+            wait_enter()
+        elif choice == 5:
+            cli_clear_cache()
+            wait_enter()
+        elif choice == 6:
+            console.print("\n[ok]Пока![/ok]")
+            break
+
+
+
+# ==== NEW (CLI) ====
+def print_banner():
+    console.print(Panel.fit(
+        "[title]Spotify Playlist Downloader[/title]\n"
+        "[muted]YouTube via yt-dlp · Selenium cookies helper[/muted]",
+        title="🎵",
+        border_style="title"
+    ))
+
+def show_main_menu() -> int:
+    table = Table(show_header=True, header_style="title")
+    table.add_column("#", justify="right", style="muted")
+    table.add_column("Действие", style="ok")
+    table.add_row("1", "Скачать плейлист по URL")
+    table.add_row("2", "Обновить cookies (ручной вход в YouTube)")
+    table.add_row("3", "Проверить cookies.txt")
+    table.add_row("4", "Настройки")
+    table.add_row("5", "Очистить кеш поиска")
+    table.add_row("6", "Выход")
+    console.print(table)
+    choice = IntPrompt.ask("[title]Выбери пункт[/title]", choices=[str(i) for i in range(1,7)])
+    return choice
+
+def wait_enter():
+    Prompt.ask("\n[muted]Нажми Enter, чтобы вернуться в меню[/muted]", default="", show_default=False)
+
+# ==== NEW (CLI) ====
+def cli_download_playlist(cookies_file: str | None):
+    # спросим URL
+    playlist_url = Prompt.ask("[title]Вставь URL плейлиста Spotify[/title]").strip()
+    if not playlist_url:
+        console.print("[err]URL пустой[/err]")
+        return
+
+    console.print("[muted]Получаю информацию о плейлисте...[/muted]")
     try:
         playlist_name, owner_name, tracks = get_spotify_playlist_info(playlist_url)
-        print(f"Найдено треков в плейлисте: {len(tracks)}")
     except Exception as e:
-        print(f"Ошибка получения информации о плейлисте: {str(e)}")
+        console.print(f"[err]Ошибка Spotify API:[/err] {e}")
         return
-    
+
+    console.print(f"[ok]Найдено треков:[/ok] {len(tracks)}")
     base_dir = f"{playlist_name} ({owner_name})"
     output_dir = base_dir
     counter = 1
     while os.path.exists(output_dir):
         output_dir = f"{base_dir}_{counter}"
         counter += 1
-    os.makedirs(output_dir)
-    
-    # Сначала находим все треки (кэшируем результаты поиска)
-    print("Поиск треков на YouTube...")
-    info_ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
-    
-    for idx, track in enumerate(tracks, 1):
-        print(f"Поиск [{idx}/{len(tracks)}]: {track['artist']} - {track['title']}")
-        find_best_match(track, info_ydl_opts, cookies_file)
-    
-    # Используем многопоточность для ускорения загрузки
-    failed_tracks = []  # Общий список неудачных загрузок
-    age_restricted_tracks = []  # Список треков с возрастными ограничениями
-    
-    # Первоначальная загрузка
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        args_list = [(idx, track, len(tracks), output_dir, cookies_file) for idx, track in enumerate(tracks, 1)]
-        results = list(executor.map(process_track, args_list))
-        
-        for result in results:
-            if result:
-                if "(требуются куки)" in result:
-                    age_restricted_tracks.append(result)
-                else:
-                    failed_tracks.append(result)
-    
-    # Обработка треков с возрастными ограничениями с повторными попытками
-    retry_count = 0
-    while age_restricted_tracks and retry_count < args.max_retries:
-        print(f"\nПопытка {retry_count + 1} из {args.max_retries} для загрузки треков с возрастными ограничениями.")
-        
-        if refresh_cookies():
-            # Обновляем cookies_file
-            cookies_file = 'cookies.txt'
-            
-            # Формируем список треков для повторной попытки
-            retry_track_names = [track.split(' (требуются куки)')[0] for track in age_restricted_tracks]
-            retry_tracks = [track for track in tracks if f"{track['artist']} - {track['title']}" in retry_track_names]
-            
-            # Очищаем список age_restricted_tracks для новой попытки
-            age_restricted_tracks = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-                args_list = [(idx, track, len(retry_tracks), output_dir, cookies_file) for idx, track in enumerate(retry_tracks, 1)]
-                results = list(executor.map(process_track, args_list))
-                
-                for result in results:
-                    if result:
-                        if "(требуются куки)" in result:
-                            age_restricted_tracks.append(result)
-                        else:
-                            failed_tracks.append(result)
-            
-            retry_count += 1
-        else:
-            break
-    
-    # Добавляем оставшиеся age_restricted_tracks в failed_tracks
-    failed_tracks.extend(age_restricted_tracks)
-    
-    if failed_tracks:
-        print("\nНе удалось скачать:")
-        for track in failed_tracks:
-            print(f" - {track}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1) Поиск кандидатов на YouTube (прогресс)
+    info_ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
+    if cookies_file and os.path.exists(cookies_file):
+        info_ydl_opts['cookiefile'] = cookies_file
+
+    console.print("\n[title]Поиск треков на YouTube[/title]")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        t1 = progress.add_task("Поиск...", total=len(tracks))
+        for track in tracks:
+            find_best_match(track, info_ydl_opts, cookies_file)
+            progress.update(t1, advance=1)
+
+    # 2) Загрузка с прогрессом по количеству треков (не байты, а штуки)
+    console.print("\n[title]Загрузка аудио[/title]")
+    failed_tracks = []
+    age_restricted_tracks = []
+
+    def _worker(args):
+        res = process_track(args)
+        return res
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        t2 = progress.add_task("Скачивание...", total=len(tracks))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CLI_SETTINGS["threads"]) as executor:
+            args_list = [(idx, track, len(tracks), output_dir, cookies_file) for idx, track in enumerate(tracks, 1)]
+            for res in executor.map(_worker, args_list):
+                if res:
+                    if "(требуются куки)" in res:
+                        age_restricted_tracks.append(res)
+                    else:
+                        failed_tracks.append(res)
+                progress.update(t2, advance=1)
+
+    # Повторные попытки для age-restricted
+    if age_restricted_tracks:
+        console.print(f"\n[warn]Треки с возрастным ограничением: {len(age_restricted_tracks)}[/warn]")
+        if Confirm.ask("Запустить обновление cookies и попробовать ещё раз?"):
+            if refresh_cookies():
+                # обновить cookies_file
+                cookies_file = 'cookies.txt'
+                retry_track_names = [t.split(' (требуются куки)')[0] for t in age_restricted_tracks]
+                retry_tracks = [t for t in tracks if f"{t['artist']} - {t['title']}" in retry_track_names]
+                age_restricted_tracks = []
+
+                console.print("\n[title]Повторная загрузка[/title]")
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    t3 = progress.add_task("Скачивание...", total=len(retry_tracks))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=CLI_SETTINGS["threads"]) as executor:
+                        args_list = [(idx, track, len(retry_tracks), output_dir, cookies_file) for idx, track in enumerate(retry_tracks, 1)]
+                        for res in executor.map(_worker, args_list):
+                            if res:
+                                if "(требуются куки)" in res:
+                                    age_restricted_tracks.append(res)
+                                else:
+                                    failed_tracks.append(res)
+                            progress.update(t3, advance=1)
+
+    # Итоги
+    if failed_tracks or age_restricted_tracks:
+        console.print("\n[warn]Не удалось скачать:[/warn]")
+        for t in failed_tracks + age_restricted_tracks:
+            console.print(f" • {t}")
+    else:
+        console.print("\n[ok]Готово! Все треки скачаны.[/ok]")
+
+    console.print(f"[muted]Папка: {output_dir}[/muted]")
+
+
+# ==== NEW (CLI) ====
+def cli_check_cookies():
+    path = "cookies.txt"
+    if not os.path.exists(path):
+        console.print("[warn]cookies.txt не найден[/warn]")
+        return
+    ok = check_cookies_validity(path)
+    console.print("[ok]cookies.txt валиден[/ok]" if ok else "[warn]cookies.txt недействителен или устарел[/warn]")
+
+def cli_settings():
+    console.print("\n[title]Настройки[/title]")
+    console.print(f"Текущие: threads={CLI_SETTINGS['threads']}, debug={CLI_SETTINGS['debug']}")
+    if Confirm.ask("Изменить число потоков?"):
+        CLI_SETTINGS["threads"] = IntPrompt.ask("threads", default=CLI_SETTINGS["threads"])
+    if Confirm.ask("Переключить DEBUG?"):
+        CLI_SETTINGS["debug"] = not CLI_SETTINGS["debug"]
+        global DEBUG
+        DEBUG = CLI_SETTINGS["debug"]
+    console.print(f"[ok]Сохранено: threads={CLI_SETTINGS['threads']}, debug={CLI_SETTINGS['debug']}[/ok]")
+
+def cli_clear_cache():
+    SEARCH_CACHE.clear()
+    console.print("[ok]Кеш поиска очищен[/ok]")
+
 
 if __name__ == "__main__":
     main()
