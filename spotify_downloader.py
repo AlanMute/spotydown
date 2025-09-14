@@ -2,17 +2,21 @@ import os
 import re
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-import yt_dlp as youtube_dl  # Это правильный импорт
+import yt_dlp as youtube_dl
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, error
 import urllib.request
 import concurrent.futures
 import argparse
 import time
+from difflib import SequenceMatcher
 
 # Настройки Spotify API
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
 CLIENT_SECRET = '942b953998a4486f91febf938aa06989'
+
+# Добавим глобальную переменную для отладки
+DEBUG = True  # Установите False чтобы отключить подробные логи
 
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name)
@@ -47,45 +51,89 @@ def get_spotify_playlist_info(playlist_url):
     
     return playlist_name, owner_name, tracks
 
+def similarity(a, b):
+    """Вычисляет схожесть между двумя строками"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
 def find_best_match(track_info, ydl_opts, cookies_file=None):
-    query = f"{track_info['artist']} - {track_info['title']}"
+    # Пробуем разные варианты запросов для улучшения результатов
+    queries = [
+        f"{track_info['artist']} - {track_info['title']} official audio",
+        f"{track_info['artist']} - {track_info['title']}",
+        f"{track_info['title']} {track_info['artist']}",
+        f"{track_info['title']}"  # Иногда лучше искать только по названию трека
+    ]
     
     # Добавляем cookies если есть
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
     
-    # ИСПРАВЛЕНИЕ: Используем правильное имя модуля youtube_dl вместо youtube_dlp
+    all_results = []
+    
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        try:
-            # Получаем информацию о первых 10 результатах
-            search_results = ydl.extract_info(f"ytsearch7:{query}", download=False)
-            
-            if not search_results or 'entries' not in search_results:
-                return None
+        for query in queries:
+            try:
+                # Получаем информацию о первых 5 результатах для каждого запроса
+                search_results = ydl.extract_info(f"ytsearch5:{query}", download=False)
                 
-            best_match = None
-            min_duration_diff = float('inf')
-            spotify_duration = track_info['duration_ms'] / 1000  # конвертируем в секунды
+                if search_results and 'entries' in search_results:
+                    for entry in search_results['entries']:
+                        if entry and entry not in all_results:
+                            all_results.append(entry)
+            except Exception as e:
+                if DEBUG:
+                    print(f"Ошибка поиска для запроса '{query}': {str(e)}")
+                continue
+    
+    if not all_results:
+        if DEBUG:
+            print(f"Не найдено результатов для всех запросов: {track_info['artist']} - {track_info['title']}")
+        return None
+    
+    best_match = None
+    best_score = -1
+    spotify_duration = track_info['duration_ms'] / 1000  # конвертируем в секунды
+    
+    if DEBUG:
+        print(f"\nПоиск для: {track_info['artist']} - {track_info['title']}")
+        print(f"Длительность Spotify: {spotify_duration:.2f} сек")
+        print("Найденные варианты:")
+    
+    for i, entry in enumerate(all_results):
+        if not entry:
+            continue
             
-            for entry in search_results['entries']:
-                if not entry:
-                    continue
-                    
-                # Сравниваем длительность с погрешностью 15 секунд
-                if entry.get('duration'):
-                    duration_diff = abs(entry.get('duration', 0) - spotify_duration)
-                    
-                    # Отдаем предпочтение видео с наиболее близкой длительностью
-                    if duration_diff < min_duration_diff and duration_diff <= 15:
-                        min_duration_diff = duration_diff
-                        best_match = entry
-                 
-            
-            return best_match if best_match else search_results['entries'][0]
-            
-        except Exception as e:
-            print(f"Ошибка поиска для {track_info['title']}: {str(e)}")
-            return None
+        entry_duration = entry.get('duration', 0)
+        duration_diff = abs(entry_duration - spotify_duration)
+        
+        # Вычисляем схожесть названия
+        title_similarity = similarity(entry['title'], track_info['title'])
+        
+        # Вычисляем схожесть с артистом (если артист упоминается в названии)
+        artist_in_title = similarity(entry['title'], track_info['artist'])
+        
+        # Вычисляем общий балл
+        # Приоритет: схожесть названия > схожесть с артистом > длительность
+        score = (title_similarity * 0.6 + artist_in_title * 0.3 + (1 / (1 + duration_diff)) * 0.1)
+        
+        # Бонус за ключевые слова
+        title_lower = entry['title'].lower()
+        if any(keyword in title_lower for keyword in ['official', 'original', 'audio', 'lyrics']):
+            score += 0.1
+        if any(keyword in title_lower for keyword in ['cover', 'remix', 'speed up']):
+            score -= 0.2
+        
+        if DEBUG:
+            print(f"{i+1}. {entry['title']} (длительность: {entry_duration} сек, разница: {duration_diff:.2f} сек, score: {score:.3f})")
+        
+        if score > best_score and duration_diff <= 20:  # Максимальная разница 20 секунд
+            best_score = score
+            best_match = entry
+    
+    if DEBUG and best_match:
+        print(f"Выбран вариант: {best_match['title']} (score: {best_score:.3f})")
+    
+    return best_match
 
 def download_audio(track_info, output_dir, cookies_file=None):
     # Настройки для получения информации
@@ -122,7 +170,6 @@ def download_audio(track_info, output_dir, cookies_file=None):
         download_ydl_opts['cookiefile'] = cookies_file
     
     try:
-        # ИСПРАВЛЕНИЕ: Используем правильное имя модуля youtube_dl вместо youtube_dlp
         with youtube_dl.YoutubeDL(download_ydl_opts) as ydl:
             ydl.download([video_url])
         return True
@@ -183,7 +230,11 @@ def export_youtube_cookies_instructions():
 def main():
     parser = argparse.ArgumentParser(description='Скачивание плейлистов Spotify')
     parser.add_argument('--cookies', help='Путь к файлу cookies YouTube для обхода ограничений', default=None)
+    parser.add_argument('--debug', help='Включить подробное логирование', action='store_true')
     args = parser.parse_args()
+    
+    global DEBUG
+    DEBUG = args.debug
     
     # Автоматически ищем cookies.txt в текущей директории
     cookies_file = args.cookies
