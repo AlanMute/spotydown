@@ -34,12 +34,11 @@ from single_track_cli import (
 )
 from app_config import ensure_music_dir, change_music_dir, load_config, save_config
 
-# Настройки Spotify API
+
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
 CLIENT_SECRET = '942b953998a4486f91febf938aa06989'
 BASE_MUSIC_DIR = None
 
-# Глобальная переменная для отладки
 DEBUG = False
 
 THEME = Theme({
@@ -52,21 +51,18 @@ THEME = Theme({
 console = Console(theme=THEME)
 st_set_console(console)
 
-# настройка «по умолчанию» — можно менять через меню
+
 CLI_SETTINGS = {
     "threads": 3,
     "debug": False,
 }
 
-# Кэш для уже найденных треков
 SEARCH_CACHE = {}
 
-# Блокировка для работы с куки
 cookies_lock = threading.Lock()
 cookies_last_checked = 0
-COOKIES_CHECK_INTERVAL = 1800  # Проверять куки каждые 30 минут
+COOKIES_CHECK_INTERVAL = 1800  
 
-# Глобальный флаг для обновления куки
 COOKIES_NEED_REFRESH = False
 
 def sanitize_filename(name):
@@ -95,12 +91,11 @@ def automate_youtube_login(driver, email, password, timeout=30):
         return False
 
     def accept_consents():
-        # Попытки закрыть разные варианты оверлеев/куки/консенса
         selectors = [
-            (By.CSS_SELECTOR, "button#accept-button"),                   # youtube cookie
+            (By.CSS_SELECTOR, "button#accept-button"),                   
             (By.CSS_SELECTOR, "button[aria-label*='Accept']"),
             (By.CSS_SELECTOR, "button[aria-label*='Принять']"),
-            (By.ID, "introAgreeButton"),                                # старый consent
+            (By.ID, "introAgreeButton"),                                
             (By.XPATH, "//button[contains(., 'I agree')]"),
             (By.XPATH, "//button[contains(., 'Accept all')]"),
             (By.XPATH, "//button[contains(., 'Я принимаю')]"),
@@ -114,7 +109,6 @@ def automate_youtube_login(driver, email, password, timeout=30):
     try:
         accept_consents()
 
-        # — Email —
         email_box = wait.until(EC.visibility_of_element_located((By.ID, "identifierId")))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", email_box)
         try:
@@ -125,10 +119,8 @@ def automate_youtube_login(driver, email, password, timeout=30):
 
         safe_click_any([(By.ID, "identifierNext")])
 
-        # Часто после Next снова возникает оверлей
         accept_consents()
 
-        # — Password —
         passwd_box = wait.until(EC.visibility_of_element_located((By.NAME, "Passwd")))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", passwd_box)
         try:
@@ -139,7 +131,6 @@ def automate_youtube_login(driver, email, password, timeout=30):
 
         safe_click_any([(By.ID, "passwordNext")])
 
-        # Ждём, пока действительно окажемся на YouTube и появится меню-аватар.
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#avatar-btn")))
         return True
     except TimeoutException as e:
@@ -160,13 +151,11 @@ def export_cookies_selenium(driver, cookies_path):
 
             for c in cookies:
                 domain = c.get('domain', '')
-                # Netscape: домен без ведущей точки -> ставим точку, иначе поддомены не покроет
                 if not domain.startswith('.'):
                     domain = '.' + domain
 
                 path = c.get('path', '/')
                 secure = 'TRUE' if c.get('secure', False) else 'FALSE'
-                # expiry должен быть int или 0
                 expiry = c.get('expiry')
                 try:
                     expiry = int(expiry)
@@ -175,10 +164,8 @@ def export_cookies_selenium(driver, cookies_path):
                 name = c.get('name', '')
                 value = c.get('value', '')
 
-                # Флаг includeSubdomains (TRUE/FALSE) — для домена с точкой TRUE
                 include_subdomains = 'TRUE' if domain.startswith('.') else 'FALSE'
 
-                # Формат: domain \t includeSubdomains \t path \t secure \t expiry \t name \t value
                 f.write(f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n")
         return True
     except Exception as e:
@@ -196,7 +183,6 @@ def setup_selenium_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--window-size=1920,1080")
 
-    # 1) Пытаемся запустить undetected-chromedriver
     try:
         driver = uc.Chrome(options=chrome_options)
         return driver
@@ -204,7 +190,6 @@ def setup_selenium_driver():
         print(f"Ошибка при настройке undetected-chromedriver: {e}")
         print("Пробуем использовать стандартный ChromeDriver...")
 
-    # 2) Резерв: обычный ChromeDriver (нужен chromedriver в PATH)
     try:
         chromedriver_path = which("chromedriver")
         service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
@@ -226,13 +211,11 @@ def automated_cookies_refresh():
         return False
 
     try:
-        # Открываем YouTube – логин выполняешь сам
         driver.get("https://www.youtube.com/")
         print("\nВ открывшемся окне браузера войди в свой аккаунт YouTube/Google.")
         print("После успешного входа вернись в консоль и нажми Enter — я выгружу cookies.")
         input("Нажми Enter, когда войдёшь... ")
 
-        # Проверим, что вход выполнен (есть аватар)
         try:
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "#avatar-btn"))
@@ -249,7 +232,6 @@ def automated_cookies_refresh():
             print("Не удалось экспортировать cookies.")
             return False
     finally:
-        # НЕ закрываем мгновенно — иногда полезно оставить окно на пару секунд
         try:
             time.sleep(2)
             driver.quit()
@@ -263,15 +245,12 @@ def check_cookies_validity(cookies_file):
         return False
     
     try:
-        # Пробуем загрузить куки
         cj = MozillaCookieJar(cookies_file)
         cj.load(ignore_discard=True, ignore_expires=True)
         
-        # Проверяем наличие основных YouTube куки
         required_cookies = ['SID', 'HSID', 'SSID', 'LOGIN_INFO']
         has_required = any(cookie.name in required_cookies for cookie in cj)
         
-        # Проверяем срок действия куки
         now = time.time()
         for cookie in cj:
             if cookie.expires and cookie.expires < now:
@@ -323,12 +302,11 @@ def get_spotify_playlist_info(playlist_url):
     owner_name = sanitize_filename(playlist['owner']['display_name'])
     tracks = []
     
-    # Получаем все треки с учетом пагинации
     results = sp.playlist_items(playlist_url)
     while results:
         for item in results['items']:
             track = item['track']
-            if track:  # Пропускаем удаленные треки
+            if track: 
                 tracks.append({
                     'artist': ', '.join([artist['name'] for artist in track['artists']]),
                     'title': track['name'],
@@ -336,7 +314,6 @@ def get_spotify_playlist_info(playlist_url):
                     'duration_ms': track['duration_ms'],
                     'cover_url': track['album']['images'][0]['url'] if track['album']['images'] else None
                 })
-        # Проверяем, есть ли еще треки
         if results['next']:
             results = sp.next(results)
         else:
@@ -349,14 +326,12 @@ def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 def find_best_match(track_info, ydl_opts, cookies_file=None):
-    # Проверяем кэш
     cache_key = f"{track_info['artist']} - {track_info['title']}"
     if cache_key in SEARCH_CACHE:
         if DEBUG:
             print(f"Используем кэшированный результат для: {cache_key}")
         return SEARCH_CACHE[cache_key]
 
-    # Запросы
     queries = [
         f"{track_info['artist']} - {track_info['title']} official audio",
         f"{track_info['artist']} - {track_info['title']}",
@@ -364,7 +339,6 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
         f"{track_info['title']}",
     ]
 
-    # yt-dlp параметры (не мутируем внешний словарь)
     ydl_search_opts = dict(ydl_opts or {})
     ydl_search_opts.setdefault("quiet", True)
     ydl_search_opts.setdefault("no_warnings", True)
@@ -374,7 +348,6 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
     ydl_search_opts.setdefault("socket_timeout", 15)
     ydl_search_opts.setdefault("extractor_args", {"youtube": {"player_client": ["web"]}})
 
-    # Добавляем cookies если есть
     if cookies_file and os.path.exists(cookies_file):
         ydl_search_opts["cookiefile"] = cookies_file
 
@@ -410,27 +383,23 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
         if not entry:
             continue
 
-        # Безопасные поля
         title = (entry.get('title') or "").strip()
         if not title:
             continue
         uploader = entry.get('uploader') or ""
-        raw_dur = entry.get('duration')  # может быть None
+        raw_dur = entry.get('duration')
         entry_duration = float(raw_dur) if raw_dur is not None else None
 
-        # Схожести
         title_similarity = similarity(title, track_info['title'])
         artist_in_title = similarity(title, track_info['artist'])
 
-        # Очки за длительность
         if entry_duration is not None:
             duration_diff = abs(entry_duration - spotify_duration)
-            duration_score = 1.0 / (1.0 + duration_diff)  # [0..1], чем ближе — тем больше
+            duration_score = 1.0 / (1.0 + duration_diff)
         else:
             duration_diff = None
-            duration_score = 0.5  # нейтрально, когда длительности нет
+            duration_score = 0.5
 
-        # Бонус/штраф за ключевые слова
         title_lower = title.lower()
         kw_bonus = 0.0
         if any(k in title_lower for k in ['official', 'original', 'audio', 'lyrics']):
@@ -438,7 +407,6 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
         if any(k in title_lower for k in ['cover', 'remix', 'speed up', 'sped up']):
             kw_bonus -= 0.2
 
-        # Итоговый скор (вес длительности уменьшен, чтобы не убивало без неё)
         score = title_similarity * 0.65 + artist_in_title * 0.30 + duration_score * 0.05 + kw_bonus
 
         if DEBUG:
@@ -446,26 +414,22 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
             diff_dbg = f"{duration_diff:.2f}" if duration_diff is not None else "—"
             print(f"{i+1}. {title} | канал: {uploader} | длит.: {dur_dbg} | Δ={diff_dbg} | score={score:.3f}")
 
-        # Условие выбора: если нет длительности — не фильтруем по 20с
         if score > best_score and (duration_diff is None or duration_diff <= 20):
             best_score = score
             best_match = entry
 
-    # Сохраняем в кэш
     SEARCH_CACHE[cache_key] = best_match
     return best_match
 
 def download_audio(track_info, output_dir, cookies_file=None):
     global COOKIES_NEED_REFRESH
     
-    # Настройки для получения информации
     info_ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
     }
     
-    # Находим лучшее совпадение по длительности
     best_match = find_best_match(track_info, info_ydl_opts, cookies_file)
     
     if not best_match or 'url' not in best_match:
@@ -474,7 +438,6 @@ def download_audio(track_info, output_dir, cookies_file=None):
     
     video_url = best_match['url']
     
-    # Настройки для скачивания
     download_ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(output_dir, f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.%(ext)s"),
@@ -492,7 +455,6 @@ def download_audio(track_info, output_dir, cookies_file=None):
         'continuedl': True,
     }
     
-    # Добавляем cookies, если указаны
     if cookies_file and os.path.exists(cookies_file):
         download_ydl_opts['cookiefile'] = cookies_file
     
@@ -523,7 +485,6 @@ def add_metadata(track_info, file_path):
         audio.tags.add(TALB(encoding=3, text=track_info['album']))
         
         if track_info['cover_url']:
-            # Кэшируем обложки, чтобы не скачивать повторно
             cover_path = os.path.join(os.path.dirname(file_path), "covers")
             os.makedirs(cover_path, exist_ok=True)
             cover_filename = f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.jpg"
@@ -567,10 +528,8 @@ def process_track(args):
 def main():
     global BASE_MUSIC_DIR
 
-    # загрузим/проверим папку для музыки (первый запуск спросит через диалог)
     BASE_MUSIC_DIR = ensure_music_dir(console)
 
-    # стартовая авто-подхват cookies.txt (как у тебя)
     cookies_file = None
     if not CLI_SETTINGS.get("no_cookies", False):
         if os.path.exists('cookies.txt'):
@@ -579,17 +538,16 @@ def main():
             if not check_cookies_validity(cookies_file):
                 console.print("[warn]cookies.txt недействителен или устарел[/warn]")
 
-    # основной цикл
-    while True:
-        console.clear()
-        print_banner()
-        choice = show_main_menu()
 
-        if choice == 1:
+    while True:
+        choice = show_main_menu()
+        if choice == 0:
+            console.print("\n[ok]Пока![/ok]")
+            break
+        elif choice == 1:
             cli_download_playlist(cookies_file)
-            wait_enter()
         elif choice == 2:
-            # одиночный трек (передаём базовую папку)
+            from single_track_cli import cli_download_single_track
             cli_download_single_track(
                 cookies_file=cookies_file,
                 sanitize_filename_func=sanitize_filename,
@@ -597,55 +555,36 @@ def main():
                 client_secret=CLIENT_SECRET,
                 base_music_dir=BASE_MUSIC_DIR,
             )
-            wait_enter()
         elif choice == 3:
             ok = automated_cookies_refresh()
             if ok:
                 cookies_file = "cookies.txt"
-            wait_enter()
         elif choice == 4:
             cli_check_cookies()
-            wait_enter()
+            Prompt.ask("\n[dim]Enter для возврата[/dim]", default="", show_default=False)
         elif choice == 5:
             cli_settings()
-            wait_enter()
+            Prompt.ask("\n[dim]Enter для возврата[/dim]", default="", show_default=False)
         elif choice == 6:
             cli_clear_cache()
-            wait_enter()
+            Prompt.ask("\n[dim]Enter для возврата[/dim]", default="", show_default=False)
         elif choice == 7:
-            # Сменить папку музыки
             BASE_MUSIC_DIR = change_music_dir(console)
-            wait_enter()
-        elif choice == 8:
-            console.print("\n[ok]Пока![/ok]")
-            break
 
 
-# ==== NEW (CLI) ====
-def print_banner():
-    music_dir_text = BASE_MUSIC_DIR or "(не задано)"
-    console.print(Panel.fit(
-        "[title]Spotify Playlist Downloader[/title]\n"
-        "[muted]YouTube via yt-dlp · Selenium cookies helper[/muted]\n"
-        f"[dim]Папка музыки:[/dim] {music_dir_text}",
-        title="🎵",
-        border_style="title"
-    ))
 
 def show_main_menu() -> int:
-    table = Table(show_header=True, header_style="title")
-    table.add_column("#", justify="right", style="muted")
-    table.add_column("Действие", style="ok")
-    table.add_row("1", "Скачать плейлист по URL")
-    table.add_row("2", "Скачать ОДИН трек (Spotify / YouTube)")
-    table.add_row("3", "Обновить cookies (ручной вход в YouTube)")
-    table.add_row("4", "Проверить cookies.txt")
-    table.add_row("5", "Настройки")
-    table.add_row("6", "Очистить кеш поиска")
-    table.add_row("7", "Изменить папку музыки…")
-    table.add_row("8", "Выход")
-    console.print(table)
-    choice = IntPrompt.ask("[title]Выбери пункт[/title]", choices=[str(i) for i in range(1,9)])
+    subtitle = f"[dim]Папка музыки:[/dim] {BASE_MUSIC_DIR or '(не задано)'}"
+    options = [
+        "Скачать плейлист по URL",
+        "Скачать ОДИН трек (Spotify / YouTube)",
+        "Обновить cookies (ручной вход в YouTube)",
+        "Проверить cookies.txt",
+        "Настройки",
+        "Очистить кеш поиска",
+        "Изменить папку музыки…",
+    ]
+    choice = ui_menu("Spotify Playlist Downloader", options, subtitle, back_text="⏻ Выход")
     return choice
 
 def wait_enter():
@@ -653,20 +592,30 @@ def wait_enter():
 
 # ==== NEW (CLI) ====
 def cli_download_playlist(cookies_file: str | None):
-    # спросим URL
-    playlist_url = Prompt.ask("[title]Вставь URL плейлиста Spotify[/title]").strip()
-    if not playlist_url:
-        console.print("[err]URL пустой[/err]")
+    # Страница №1 — запрос URL
+    ui_page("Скачать плейлист", "Вставь URL плейлиста Spotify. Если передумал — введи 0.")
+    playlist_url = prompt_cancelable("URL плейлиста")
+    if playlist_url is None or not playlist_url:
         return
 
-    console.print("[muted]Получаю информацию о плейлисте...[/muted]")
+    # Страница №2 — получаем инфу
+    ui_page("Скачать плейлист", "[muted]Получаю информацию о плейлисте...[/muted]")
     try:
         playlist_name, owner_name, tracks = get_spotify_playlist_info(playlist_url)
     except Exception as e:
-        console.print(f"[err]Ошибка Spotify API:[/err] {e}")
+        ui_page("Скачать плейлист", f"[red]Ошибка Spotify API:[/red] {e}\n\n[dim]Нажми Enter для возврата[/dim]")
+        Prompt.ask("", default="", show_default=False)
         return
 
-    console.print(f"[ok]Найдено треков:[/ok] {len(tracks)}")
+    if not tracks:
+        ui_page("Скачать плейлист", "[yellow]В плейлисте не нашлось треков[/yellow]\n\n[dim]Enter для возврата[/dim]")
+        Prompt.ask("", default="", show_default=False)
+        return
+
+    subtitle = f"[ok]Найдено треков:[/ok] {len(tracks)}\n[dim]{playlist_name} — {owner_name}[/dim]"
+    ui_page("Скачать плейлист", subtitle)
+
+    # Создаём подпапку в BASE_MUSIC_DIR
     base_dir_name = f"{playlist_name} ({owner_name})"
     output_dir = os.path.join(BASE_MUSIC_DIR, base_dir_name)
     counter = 1
@@ -675,12 +624,12 @@ def cli_download_playlist(cookies_file: str | None):
         counter += 1
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1) Поиск кандидатов на YouTube (прогресс)
+    # 1) Поиск кандидатов
     info_ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
     if cookies_file and os.path.exists(cookies_file):
         info_ydl_opts['cookiefile'] = cookies_file
 
-    console.print("\n[title]Поиск треков на YouTube[/title]")
+    ui_page("Скачать плейлист", "[title]Поиск треков на YouTube[/title]")
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -694,14 +643,13 @@ def cli_download_playlist(cookies_file: str | None):
             find_best_match(track, info_ydl_opts, cookies_file)
             progress.update(t1, advance=1)
 
-    # 2) Загрузка с прогрессом по количеству треков (не байты, а штуки)
-    console.print("\n[title]Загрузка аудио[/title]")
+    # 2) Загрузка
+    ui_page("Скачать плейлист", "[title]Загрузка аудио[/title]")
     failed_tracks = []
     age_restricted_tracks = []
 
     def _worker(args):
-        res = process_track(args)
-        return res
+        return process_track(args)
 
     with Progress(
         SpinnerColumn(),
@@ -712,7 +660,6 @@ def cli_download_playlist(cookies_file: str | None):
         console=console,
     ) as progress:
         t2 = progress.add_task("Скачивание...", total=len(tracks))
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=CLI_SETTINGS["threads"]) as executor:
             args_list = [(idx, track, len(tracks), output_dir, cookies_file) for idx, track in enumerate(tracks, 1)]
             for res in executor.map(_worker, args_list):
@@ -723,18 +670,17 @@ def cli_download_playlist(cookies_file: str | None):
                         failed_tracks.append(res)
                 progress.update(t2, advance=1)
 
-    # Повторные попытки для age-restricted
     if age_restricted_tracks:
-        console.print(f"\n[warn]Треки с возрастным ограничением: {len(age_restricted_tracks)}[/warn]")
-        if Confirm.ask("Запустить обновление cookies и попробовать ещё раз?"):
+        ui_page("Скачать плейлист", f"[warn]Треки с возрастным ограничением: {len(age_restricted_tracks)}[/warn]")
+        if Confirm.ask("Обновить cookies и попробовать ещё раз?"):
             if refresh_cookies():
-                # обновить cookies_file
                 cookies_file = 'cookies.txt'
                 retry_track_names = [t.split(' (требуются куки)')[0] for t in age_restricted_tracks]
                 retry_tracks = [t for t in tracks if f"{t['artist']} - {t['title']}" in retry_track_names]
+
                 age_restricted_tracks = []
 
-                console.print("\n[title]Повторная загрузка[/title]")
+                ui_page("Скачать плейлист", "[title]Повторная загрузка[/title]")
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -754,15 +700,12 @@ def cli_download_playlist(cookies_file: str | None):
                                     failed_tracks.append(res)
                             progress.update(t3, advance=1)
 
-    # Итоги
     if failed_tracks or age_restricted_tracks:
-        console.print("\n[warn]Не удалось скачать:[/warn]")
-        for t in failed_tracks + age_restricted_tracks:
-            console.print(f" • {t}")
+        msg = "[warn]Не удалось скачать:[/warn]\n" + "\n".join(f" • {t}" for t in (failed_tracks + age_restricted_tracks))
     else:
-        console.print("\n[ok]Готово! Все треки скачаны.[/ok]")
-
-    console.print(f"[muted]Папка: {output_dir}[/muted]")
+        msg = "[ok]Готово! Все треки скачаны.[/ok]"
+    ui_page("Скачать плейлист", f"{msg}\n\n[dim]Папка:[/dim] {output_dir}\n\n[dim]Enter для возврата[/dim]")
+    Prompt.ask("", default="", show_default=False)
 
 
 # ==== NEW (CLI) ====
@@ -789,6 +732,40 @@ def cli_clear_cache():
     SEARCH_CACHE.clear()
     console.print("[ok]Кеш поиска очищен[/ok]")
 
+def ui_page(title: str, subtitle: str | None = None):
+    """Чистит консоль и рисует «страницу» с заголовком и пояснением."""
+    console.clear()
+    console.print(Panel.fit(
+        (subtitle or ""),
+        title=title,
+        border_style="title"
+    ))
+
+def ui_menu(title: str, options: list[str], subtitle: str | None = None, back_text: str = "⟵ Назад") -> int:
+    """
+    Рисует страницу-меню. Возвращает выбранный номер:
+      0 — «Назад», 1..N — пункт из options.
+    """
+    ui_page(title, subtitle)
+    table = Table(show_header=True, header_style="title")
+    table.add_column("#", justify="right", style="muted", width=3)
+    table.add_column("Действие", style="ok")
+    table.add_row("0", back_text)
+    for i, opt in enumerate(options, start=1):
+        table.add_row(str(i), opt)
+    console.print(table)
+    choice = IntPrompt.ask("Выбери пункт", choices=[str(i) for i in range(0, len(options)+1)])
+    return int(choice)
+
+def prompt_cancelable(label: str, default: str = "") -> str | None:
+    """
+    Prompt с подсказкой про «0 — Назад».
+    Возвращает None, если пользователь ввёл 0 (отмена).
+    """
+    val = Prompt.ask(f"{label} [dim](0 — назад)[/dim]", default=default)
+    if val.strip() == "0":
+        return None
+    return val.strip()
 
 if __name__ == "__main__":
     main()

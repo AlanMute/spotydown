@@ -1,4 +1,3 @@
-# single_track_cli.py
 import os
 from typing import Optional, List, Tuple
 from rich.console import Console
@@ -35,20 +34,22 @@ def normalize_youtube_url(url: str) -> str:
             v = qs.get("v", [None])[0]
             if v:
                 return f"https://www.youtube.com/watch?v={v}"
-        # youtu.be/ID
         if u.netloc.endswith("youtu.be"):
             vid = u.path.lstrip("/")
             if vid:
                 return f"https://www.youtube.com/watch?v={vid}"
     except Exception:
         pass
-    # если не распознали, вернём как есть
     return url
 
 def set_console(c: Console):
     """Вызывается из host-приложения, чтобы модуль пользовался его Console."""
     global console
     console = c
+
+def page(title: str, subtitle: str | None = None):
+    console.clear()
+    console.print(Panel.fit(subtitle or "", title=title, border_style="title"))
 
 # ---------- Spotify helpers ----------
 
@@ -85,7 +86,6 @@ def yt_search_for_track(track_info: dict, cookies_file: Optional[str], limit: in
     if cookies_file and os.path.exists(cookies_file):
         opts["cookiefile"] = cookies_file
     else:
-        # мягкий фолбэк — возьмём куки из локального браузера (Windows/Chrome по умолчанию)
         opts["cookiesfrombrowser"] = ("chrome",)
 
     seen_urls = set()
@@ -112,7 +112,7 @@ def yt_search_for_track(track_info: dict, cookies_file: Optional[str], limit: in
 
 def yt_get_video_info(url: str, cookies_file: Optional[str]) -> Optional[dict]:
     """Достаёт инфу по прямой YouTube-ссылке (title/uploader/duration/thumbnail)."""
-    url = normalize_youtube_url(url)  # <- убираем &list=...
+    url = normalize_youtube_url(url) 
     u = urlparse(url)
     host = u.netloc.lower()
     if "youtube.com" not in host and "youtu.be" not in host:
@@ -121,10 +121,9 @@ def yt_get_video_info(url: str, cookies_file: Optional[str]) -> Optional[dict]:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,          # <- ВАЖНО
+        "noplaylist": True,          
         "socket_timeout": 15,
         "prefer_ipv4": True,
-        # Небольшая помощь парсеру YouTube
         "extractor_args": {"youtube": {"player_client": ["web"]}},
     }
     if cookies_file and os.path.exists(cookies_file):
@@ -135,7 +134,6 @@ def yt_get_video_info(url: str, cookies_file: Optional[str]) -> Optional[dict]:
     try:
         with youtube_dl.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            # Если вдруг всё равно пришёл плейлист — возьмём первый элемент
             if info.get("_type") == "playlist":
                 entries = info.get("entries") or []
                 if entries:
@@ -160,14 +158,13 @@ def parse_title_guess(yt_title: str) -> tuple[str, str]:
     parts = [p.strip() for p in yt_title.split(" - ", 1)]
     if len(parts) == 2 and parts[0] and parts[1]:
         return parts[0], parts[1]
-    # fallback: всё кладём в title
     return "", yt_title.strip()
 
 # ---------- Target folder ----------
 
-def choose_target_folder(default_name: str, base_music_dir: str) -> str:
+def choose_target_folder(default_name: str, base_music_dir: str) -> Optional[str]:
     """
-    Выбор подпапки назначения ВНУТРИ base_music_dir: существующая или новая.
+    Выбор подпапки ВНУТРИ base_music_dir. Возвращает путь или None, если выбрали «Назад».
     """
     base = base_music_dir or os.getcwd()
     try:
@@ -176,9 +173,11 @@ def choose_target_folder(default_name: str, base_music_dir: str) -> str:
         dirs = []
     dirs_sorted = sorted(dirs, key=str.lower)
 
-    table = Table(title=f"Куда сохранить трек?  [dim]{base}[/dim]")
+    page("Куда сохранить трек?", f"[dim]{base}[/dim]")
+    table = Table(show_header=True, header_style="title")
     table.add_column("#", justify="right")
     table.add_column("Подпапка")
+    table.add_row("0", "⟵ Назад")
 
     choices = {}
     idx = 1
@@ -191,21 +190,21 @@ def choose_target_folder(default_name: str, base_music_dir: str) -> str:
     table.add_row(new_idx, f"[italic]Создать новую: {default_name}[/italic]")
     console.print(table)
 
-    pick = Prompt.ask("Выбери номер папки", default=new_idx)
+    pick = Prompt.ask("Выбери номер", default=new_idx)
+    if pick == "0":
+        return None
     if pick == new_idx:
         target = os.path.join(base, default_name)
         os.makedirs(target, exist_ok=True)
         return target
-    # существующая подпапка
     picked_name = choices.get(pick)
     if picked_name:
         return os.path.join(base, picked_name)
-    # fallback — создаём новую по умолчанию
+    
     target = os.path.join(base, default_name)
     os.makedirs(target, exist_ok=True)
     return target
 
-# ---------- Download + tag ----------
 
 def _fetch_cover_bytes(url: str) -> tuple[bytes, str, str]:
     """
@@ -219,42 +218,35 @@ def _fetch_cover_bytes(url: str) -> tuple[bytes, str, str]:
     if not url:
         return b"", "", ""
 
-    # ==== качаем ====
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = resp.read()
-            # ctype = (resp.headers.get("Content-Type") or "").split(";")[0].lower()
+            
     except Exception:
         return b"", "", ""
 
-    # ==== нормализуем через Pillow ====
     try:
-        from PIL import Image, ImageOps  # pip install pillow
+        from PIL import Image, ImageOps 
         img = Image.open(BytesIO(data))
 
-        # учтём EXIF-ориентацию
         try:
             img = ImageOps.exif_transpose(img)
         except Exception:
             pass
 
-        # в RGB (убираем альфу/индексные палитры/CMYK)
         if img.mode not in ("RGB",):
             img = img.convert("RGB")
 
-        # центр-кроп до квадрата
         w, h = img.size
         side = min(w, h)
         left = (w - side) // 2
         top  = (h - side) // 2
         img = img.crop((left, top, left + side, top + side))
 
-        # ресайз до COVER_SIZE
         if img.size != (COVER_SIZE, COVER_SIZE):
             img = img.resize((COVER_SIZE, COVER_SIZE), Image.LANCZOS)
 
-        # сохраняем baseline JPEG, без progressive
         quality = 88
         def encode(q: int) -> bytes:
             buf = BytesIO()
@@ -269,7 +261,7 @@ def _fetch_cover_bytes(url: str) -> tuple[bytes, str, str]:
             return buf.getvalue()
 
         out = encode(quality)
-        # ужимаем, если нужно
+        
         while len(out) > COVER_MAX_BYTES and quality > 60:
             quality -= 6
             out = encode(quality)
@@ -343,7 +335,7 @@ def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cooki
         "skip_unavailable_fragments": True,
         "socket_timeout": 30,
         "prefer_ipv4": True,
-        "noplaylist": True,    # <- ВАЖНО
+        "noplaylist": True, 
     }
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts["cookiefile"] = cookies_file
@@ -380,175 +372,183 @@ def cli_download_single_track(
     client_secret: str,
     base_music_dir: str,
 ):
-    """Верхнеуровневый сценарий: выбор источника, URL, выбор выдачи/папки, скачивание."""
     global sanitize_filename
-    sanitize_filename = sanitize_filename_func  # привязываем переданную функцию
+    sanitize_filename = sanitize_filename_func
 
-    console.print(Panel.fit("Скачать одиночный трек", title="🎯", border_style="title"))
-    src = int(Prompt.ask(
-        "Источник (1 = Spotify URL, 2 = YouTube URL)",
-        choices=["1","2"],
-        default="1"
-    ))
+    page("Скачать одиночный трек", "Выбери источник. В любой момент вводи 0 — чтобы вернуться.")
+    src = IntPrompt.ask("Источник (0 — назад, 1 = Spotify URL, 2 = YouTube URL)", choices=["0", "1", "2"], default="1")
+    if src == 0:
+        return
 
-    # ---------- Ветка 1: Spotify URL -> выдача с YouTube ----------
+    # ---------- Ветка 1: Spotify URL ----------
     if src == 1:
-        sp_url = Prompt.ask("Вставь ссылку на трек Spotify").strip()
-        if not sp_url:
-            console.print("[red]URL пустой[/red]")
-            return
+        while True:
+            page("Один трек • Spotify", "Вставь ссылку на трек Spotify (или 0 — назад).")
+            sp_url = Prompt.ask("URL", default="")
+            if sp_url.strip() == "0" or not sp_url.strip():
+                return
+            sp_url = sp_url.strip()
 
-        # 1) Тянем мету из Spotify
-        try:
-            sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
-            tr = sp.track(sp_url)
-            artist = ", ".join(a["name"] for a in tr["artists"])
-            title  = tr["name"]
-            album  = tr["album"]["name"]
-            duration_ms = int(tr.get("duration_ms") or 0)
-            cover_url   = (tr["album"]["images"][0]["url"] if tr["album"]["images"] else "")
-        except Exception as e:
-            console.print(f"[red]Ошибка Spotify API:[/red] {e}")
-            return
-
-        track_info = {
-            "artist": artist,
-            "title": title,
-            "album": album,
-            "duration_ms": duration_ms,
-            "cover_url": cover_url,  # мета и обложка из Spotify (как ты хотел для споти-кейса)
-        }
-
-        # 2) Ищем кандидатов на YouTube по метаданным
-        query = f"{artist} - {title}"
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "noplaylist": True,
-            "prefer_ipv4": True,
-            "socket_timeout": 15,
-            "extractor_args": {"youtube": {"player_client": ["web"]}},
-        }
-        if cookies_file and os.path.exists(cookies_file):
-            ydl_opts["cookiefile"] = cookies_file
-
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            t = progress.add_task("Ищу на YouTube...", total=None)
-            candidates = []
+            page("Один трек • Spotify", "[muted]Получаю метаданные трека...[/muted]")
             try:
-                with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                    res = ydl.extract_info(f"ytsearch10:{query}", download=False)
-                    for e in (res.get("entries") or []):
-                        if e:
-                            candidates.append(e)
+                sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
+                tr = sp.track(sp_url)
+                artist = ", ".join(a["name"] for a in tr["artists"])
+                title  = tr["name"]
+                album  = tr["album"]["name"]
+                duration_ms = int(tr.get("duration_ms") or 0)
+                cover_url   = (tr["album"]["images"][0]["url"] if tr["album"]["images"] else "")
             except Exception as e:
+                page("Один трек • Spotify", f"[red]Ошибка Spotify API:[/red] {e}\n\n[dim]Enter для возврата[/dim]")
+                Prompt.ask("", default="", show_default=False)
+                return
+
+            meta = Table(show_header=False, box=None)
+            meta.add_row("[muted]Артист:[/muted]", artist)
+            meta.add_row("[muted]Название:[/muted]", title)
+            meta.add_row("[muted]Альбом:[/muted]", album)
+            meta.add_row("[muted]Длительность:[/muted]", format_duration(duration_ms // 1000))
+            meta.add_row("[muted]Обложка:[/muted]", cover_url or "—")
+            console.clear()
+            console.print(Panel(meta, title="Мета из Spotify", border_style="title"))
+
+            track_info = {
+                "artist": artist,
+                "title": title,
+                "album": album,
+                "duration_ms": duration_ms,
+                "cover_url": cover_url,
+            }
+
+            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+                t = progress.add_task("Ищу на YouTube...", total=None)
                 candidates = []
-            progress.update(t, completed=1)
+                try:
+                    ydl_opts = {
+                        "quiet": True,
+                        "no_warnings": True,
+                        "extract_flat": True,
+                        "noplaylist": True,
+                        "prefer_ipv4": True,
+                        "socket_timeout": 15,
+                        "extractor_args": {"youtube": {"player_client": ["web"]}},
+                    }
+                    if cookies_file and os.path.exists(cookies_file):
+                        ydl_opts["cookiefile"] = cookies_file
+                    query = f"{artist} - {title}"
+                    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                        res = ydl.extract_info(f"ytsearch10:{query}", download=False)
+                        for e in (res.get("entries") or []):
+                            if e:
+                                candidates.append(e)
+                except Exception:
+                    candidates = []
+                progress.update(t, completed=1)
 
-        if not candidates:
-            console.print("[yellow]Ничего не нашёл на YouTube по этому треку[/yellow]")
+            if not candidates:
+                page("Один трек • Spotify", "[yellow]Ничего не нашёл на YouTube по этому треку[/yellow]\n\n[dim]Enter для возврата[/dim]")
+                Prompt.ask("", default="", show_default=False)
+                return
+
+            table = Table(show_header=True, header_style="title")
+            table.add_column("#", justify="right", style="muted")
+            table.add_column("Название", style="ok")
+            table.add_column("Канал", style="muted")
+            table.add_column("Длит.", style="muted")
+            table.add_row("0", "⟵ Назад", "", "")
+            for i, e in enumerate(candidates, 1):
+                title_e = (e.get("title") or "").strip()
+                uploader = e.get("uploader") or ""
+                dur = e.get("duration")
+                dur_s = format_duration(int(dur)) if isinstance(dur, (int, float)) else "—"
+                table.add_row(str(i), title_e, uploader, dur_s)
+            console.print(table)
+
+            idx = IntPrompt.ask("Выбери номер", choices=[str(i) for i in range(0, len(candidates)+1)])
+            if idx == 0:
+                return
+            chosen = candidates[int(idx)-1]
+
+            default_dir = f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}"
+            target_dir  = choose_target_folder(default_dir, base_music_dir)
+            if target_dir is None:
+                return
+
+            page("Один трек • Spotify", "[muted]Скачивание и тегирование...[/muted]")
+            ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file)
+            if ok:
+                page("Один трек • Spotify", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
+                Prompt.ask("", default="", show_default=False)
+            else:
+                page("Один трек • Spotify", f"[red]Ошибка:[/red] {err}\n\n[dim]Enter для возврата[/dim]")
+                Prompt.ask("", default="", show_default=False)
             return
 
-        # 3) Покажем меню выбора кандидата
-        table = Table(show_header=True, header_style="title")
-        table.add_column("#", justify="right", style="muted")
-        table.add_column("Название", style="ok")
-        table.add_column("Канал", style="muted")
-        table.add_column("Длит.", style="muted")
-        for i, e in enumerate(candidates, 1):
-            title_e = (e.get("title") or "").strip()
-            uploader = e.get("uploader") or ""
-            dur = e.get("duration")
-            dur_s = format_duration(int(dur)) if isinstance(dur, (int, float)) else "—"
-            table.add_row(str(i), title_e, uploader, dur_s)
-        console.print(table)
-
-        try:
-            idx = IntPrompt.ask("Выбери номер варианта", choices=[str(i) for i in range(1, len(candidates)+1)])
-        except Exception:
+    # ---------- Ветка 2: YouTube URL ----------
+    while True:
+        page("Один трек • YouTube", "Вставь ссылку на видео (или 0 — назад).")
+        yt_url = Prompt.ask("URL", default="")
+        if yt_url.strip() == "0" or not yt_url.strip():
             return
-        chosen = candidates[int(idx)-1]
+        yt_url = yt_url.strip()
 
-        # 4) Куда сохраняем
+        page("Один трек • YouTube", "[muted]Извлекаю информацию о видео...[/muted]")
+        info = yt_get_video_info(yt_url, cookies_file)
+        if not info:
+            page("Один трек • YouTube", "[red]Не удалось извлечь информацию о видео[/red]\n\n[dim]Enter для возврата[/dim]")
+            Prompt.ask("", default="", show_default=False)
+            return
+
+        artist_guess, title_guess = parse_title_guess(info["title"])
+        default_artist = artist_guess or info["uploader"] or "Unknown Artist"
+        default_title  = title_guess  or info["title"]     or "Unknown Title"
+        default_album  = info["uploader"] or "YouTube"
+
+        meta = Table(show_header=False, box=None)
+        meta.add_row("[muted]Видео:[/muted]", info["title"])
+        meta.add_row("[muted]Канал:[/muted]", info["uploader"])
+        meta.add_row("[muted]Длительность:[/muted]", format_duration(info["duration"]))
+        meta.add_row("[muted]Предполагаемый артист:[/muted]", default_artist)
+        meta.add_row("[muted]Предполагаемое название:[/muted]", default_title)
+        console.clear()
+        console.print(Panel(meta, title="Инфо YouTube", border_style="title"))
+
+        keep = Confirm.ask("Оставить эти теги?", default=True)
+        if keep:
+            track_info = {
+                "artist": default_artist,
+                "title":  default_title,
+                "album":  default_album,
+                "duration_ms": info["duration"] * 1000,
+                "cover_url": info.get("thumbnail"),
+            }
+        else:
+            artist = Prompt.ask("Автор",   default=default_artist or "Unknown Artist")
+            if artist.strip() == "0":
+                return
+            title  = Prompt.ask("Название", default=default_title  or "Unknown Title")
+            if title.strip() == "0":
+                return
+            track_info = {
+                "artist": artist.strip(),
+                "title":  title.strip(),
+                "album":  default_album,
+                "duration_ms": info["duration"] * 1000,
+                "cover_url": info.get("thumbnail"),
+            }
+
         default_dir = f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}"
         target_dir  = choose_target_folder(default_dir, base_music_dir)
+        if target_dir is None:
+            return
 
-        # 5) Скачиваем по выбранному YouTube URL + пишем мету из Spotify
-        ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file)
-        if ok:
-            console.print(f"[bold green]Готово![/bold green] Файл в папке: [dim]{target_dir}[/dim]")
-        else:
-            console.print(f"[red]Ошибка:[/red] {err}")
-        return
-
-
-    # ---------- Ветка 2: YouTube URL напрямую ----------
-    yt_url = Prompt.ask("Вставь ссылку на YouTube-видео").strip()
-    if not yt_url:
-        console.print("[red]URL пустой[/red]")
-        return
-
-    # Покажем индикатор извлечения
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        t = progress.add_task("Извлекаю информацию о видео...", total=None)
-        info = yt_get_video_info(yt_url, cookies_file)
-        progress.update(t, completed=1)
-
-    if not info:
-        console.print("[red]Не удалось извлечь информацию о видео[/red]")
-        return
-
-    console.print(f"[green]Видео:[/green] {info['title']}  [dim]({format_duration(info['duration'])})[/dim] • [cyan]{info['uploader']}[/cyan]")
-
-    # Дефолтные теги из YouTube
-    artist_guess, title_guess = parse_title_guess(info["title"])
-    default_artist = artist_guess or info["uploader"] or "Unknown Artist"
-    default_title  = title_guess  or info["title"]     or "Unknown Title"
-    default_album  = info["uploader"] or "YouTube"  # альбом берём как канал
-
-    # Разрешим пользователю при желании поправить автора/название вручную
-    keep = Confirm.ask("Оставить теги из YouTube как есть?", default=True)
-    if keep:
-        track_info = {
-            "artist": default_artist,
-            "title":  default_title,
-            "album":  default_album,
-            "duration_ms": info["duration"] * 1000,
-            "cover_url": info.get("thumbnail"),  # превью видео
-        }
-    else:
-        artist = Prompt.ask("Автор",   default=default_artist or "Unknown Artist")
-        title  = Prompt.ask("Название", default=default_title  or "Unknown Title")
-        track_info = {
-            "artist": artist,
-            "title":  title,
-            "album":  default_album,
-            "duration_ms": info["duration"] * 1000,
-            "cover_url": info.get("thumbnail"),
-        }
-
-    # Куда сохраняем
-    default_dir = f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}"
-    target_dir  = choose_target_folder(default_dir, base_music_dir)
-
-    # Скачиваем и тэгируем
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        t = progress.add_task("Скачивание и тегирование...", total=None)
+        page("Один трек • YouTube", "[muted]Скачивание и тегирование...[/muted]")
         ok, err = download_audio_by_url(info["url"], track_info, target_dir, cookies_file)
-        progress.update(t, completed=1)
+        if ok:
+            page("Один трек • YouTube", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
+            Prompt.ask("", default="", show_default=False)
+        else:
+            page("Один трек • YouTube", f"[red]Ошибка:[/red] {err}\n\n[dim]Enter для возврата[/dim]")
+            Prompt.ask("", default="", show_default=False)
+        return
 
-    if ok:
-        console.print(f"[bold green]Готово![/bold green] Файл в папке: [dim]{target_dir}[/dim]")
-    else:
-        console.print(f"[red]Ошибка:[/red] {err}")
