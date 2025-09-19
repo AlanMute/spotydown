@@ -28,10 +28,16 @@ from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.theme import Theme
+from single_track_cli import (
+    set_console as st_set_console,
+    cli_download_single_track,
+)
+from app_config import ensure_music_dir, change_music_dir, load_config, save_config
 
 # Настройки Spotify API
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
 CLIENT_SECRET = '942b953998a4486f91febf938aa06989'
+BASE_MUSIC_DIR = None
 
 # Глобальная переменная для отладки
 DEBUG = False
@@ -44,6 +50,7 @@ THEME = Theme({
     "muted": "dim",
 })
 console = Console(theme=THEME)
+st_set_console(console)
 
 # настройка «по умолчанию» — можно менять через меню
 CLI_SETTINGS = {
@@ -348,87 +355,104 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
         if DEBUG:
             print(f"Используем кэшированный результат для: {cache_key}")
         return SEARCH_CACHE[cache_key]
-    
-    # Пробуем разные варианты запросов для улучшения результатов
+
+    # Запросы
     queries = [
         f"{track_info['artist']} - {track_info['title']} official audio",
         f"{track_info['artist']} - {track_info['title']}",
         f"{track_info['title']} {track_info['artist']}",
-        f"{track_info['title']}"  # Иногда лучше искать только по названию трека
+        f"{track_info['title']}",
     ]
-    
+
+    # yt-dlp параметры (не мутируем внешний словарь)
+    ydl_search_opts = dict(ydl_opts or {})
+    ydl_search_opts.setdefault("quiet", True)
+    ydl_search_opts.setdefault("no_warnings", True)
+    ydl_search_opts.setdefault("extract_flat", True)
+    ydl_search_opts.setdefault("noplaylist", True)
+    ydl_search_opts.setdefault("prefer_ipv4", True)
+    ydl_search_opts.setdefault("socket_timeout", 15)
+    ydl_search_opts.setdefault("extractor_args", {"youtube": {"player_client": ["web"]}})
+
     # Добавляем cookies если есть
     if cookies_file and os.path.exists(cookies_file):
-        ydl_opts['cookiefile'] = cookies_file
-    
+        ydl_search_opts["cookiefile"] = cookies_file
+
     all_results = []
-    
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+    with youtube_dl.YoutubeDL(ydl_search_opts) as ydl:
         for query in queries:
             try:
-                # Получаем информацию о первых 5 результатах для каждого запроса
                 search_results = ydl.extract_info(f"ytsearch5:{query}", download=False)
-                
                 if search_results and 'entries' in search_results:
-                    for entry in search_results['entries']:
+                    for entry in search_results['entries'] or []:
                         if entry and entry not in all_results:
                             all_results.append(entry)
             except Exception as e:
                 if DEBUG:
-                    print(f"Ошибка поиска для запроса '{query}': {str(e)}")
+                    print(f"Ошибка поиска для '{query}': {e}")
                 continue
-    
+
     if not all_results:
         if DEBUG:
-            print(f"Не найдено результатов для всех запросов: {track_info['artist']} - {track_info['title']}")
+            print(f"Не найдено результатов: {track_info['artist']} - {track_info['title']}")
         return None
-    
+
     best_match = None
-    best_score = -1
-    spotify_duration = track_info['duration_ms'] / 1000  # конвертируем в секунды
-    
+    best_score = -1.0
+    spotify_duration = (track_info.get('duration_ms') or 0) / 1000.0  # сек
+
     if DEBUG:
         print(f"\nПоиск для: {track_info['artist']} - {track_info['title']}")
         print(f"Длительность Spotify: {spotify_duration:.2f} сек")
         print("Найденные варианты:")
-    
+
     for i, entry in enumerate(all_results):
         if not entry:
             continue
-            
-        entry_duration = entry.get('duration', 0)
-        duration_diff = abs(entry_duration - spotify_duration)
-        
-        # Вычисляем схожесть названия
-        title_similarity = similarity(entry['title'], track_info['title'])
-        
-        # Вычисляем схожесть с артистом (если артист упоминается в названии)
-        artist_in_title = similarity(entry['title'], track_info['artist'])
-        
-        # Вычисляем общий балл
-        # Приоритет: схожесть названия > схожесть с артистом > длительность
-        score = (title_similarity * 0.6 + artist_in_title * 0.3 + (1 / (1 + duration_diff)) * 0.1)
-        
-        # Бонус за ключевые слова
-        title_lower = entry['title'].lower()
-        if any(keyword in title_lower for keyword in ['official', 'original', 'audio', 'lyrics']):
-            score += 0.1
-        if any(keyword in title_lower for keyword in ['cover', 'remix', 'speed up']):
-            score -= 0.2
-        
+
+        # Безопасные поля
+        title = (entry.get('title') or "").strip()
+        if not title:
+            continue
+        uploader = entry.get('uploader') or ""
+        raw_dur = entry.get('duration')  # может быть None
+        entry_duration = float(raw_dur) if raw_dur is not None else None
+
+        # Схожести
+        title_similarity = similarity(title, track_info['title'])
+        artist_in_title = similarity(title, track_info['artist'])
+
+        # Очки за длительность
+        if entry_duration is not None:
+            duration_diff = abs(entry_duration - spotify_duration)
+            duration_score = 1.0 / (1.0 + duration_diff)  # [0..1], чем ближе — тем больше
+        else:
+            duration_diff = None
+            duration_score = 0.5  # нейтрально, когда длительности нет
+
+        # Бонус/штраф за ключевые слова
+        title_lower = title.lower()
+        kw_bonus = 0.0
+        if any(k in title_lower for k in ['official', 'original', 'audio', 'lyrics']):
+            kw_bonus += 0.05
+        if any(k in title_lower for k in ['cover', 'remix', 'speed up', 'sped up']):
+            kw_bonus -= 0.2
+
+        # Итоговый скор (вес длительности уменьшен, чтобы не убивало без неё)
+        score = title_similarity * 0.65 + artist_in_title * 0.30 + duration_score * 0.05 + kw_bonus
+
         if DEBUG:
-            print(f"{i+1}. {entry['title']} (длительность: {entry_duration} сек, разница: {duration_diff:.2f} сек, score: {score:.3f})")
-        
-        if score > best_score and duration_diff <= 20:  # Максимальная разница 20 секунд
+            dur_dbg = f"{int(entry_duration)}" if entry_duration is not None else "—"
+            diff_dbg = f"{duration_diff:.2f}" if duration_diff is not None else "—"
+            print(f"{i+1}. {title} | канал: {uploader} | длит.: {dur_dbg} | Δ={diff_dbg} | score={score:.3f}")
+
+        # Условие выбора: если нет длительности — не фильтруем по 20с
+        if score > best_score and (duration_diff is None or duration_diff <= 20):
             best_score = score
             best_match = entry
-    
-    if DEBUG and best_match:
-        print(f"Выбран вариант: {best_match['title']} (score: {best_score:.3f})")
-    
+
     # Сохраняем в кэш
     SEARCH_CACHE[cache_key] = best_match
-    
     return best_match
 
 def download_audio(track_info, output_dir, cookies_file=None):
@@ -518,7 +542,7 @@ def add_metadata(track_info, file_path):
                     desc='Cover',
                     data=img.read()
                 ))
-        audio.save()
+        audio.save(v2_version=3)
     except Exception as e:
         print(f"Ошибка добавления метаданных для {track_info['title']}: {str(e)}")
 
@@ -541,6 +565,11 @@ def process_track(args):
         return f"{track['artist']} - {track['title']} (ошибка загрузки)"
 
 def main():
+    global BASE_MUSIC_DIR
+
+    # загрузим/проверим папку для музыки (первый запуск спросит через диалог)
+    BASE_MUSIC_DIR = ensure_music_dir(console)
+
     # стартовая авто-подхват cookies.txt (как у тебя)
     cookies_file = None
     if not CLI_SETTINGS.get("no_cookies", False):
@@ -549,7 +578,6 @@ def main():
             console.print("[muted]Найден cookies.txt[/muted]")
             if not check_cookies_validity(cookies_file):
                 console.print("[warn]cookies.txt недействителен или устарел[/warn]")
-                # не заставляем сразу обновлять — можно из меню
 
     # основной цикл
     while True:
@@ -561,30 +589,45 @@ def main():
             cli_download_playlist(cookies_file)
             wait_enter()
         elif choice == 2:
+            # одиночный трек (передаём базовую папку)
+            cli_download_single_track(
+                cookies_file=cookies_file,
+                sanitize_filename_func=sanitize_filename,
+                client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+                base_music_dir=BASE_MUSIC_DIR,
+            )
+            wait_enter()
+        elif choice == 3:
             ok = automated_cookies_refresh()
             if ok:
                 cookies_file = "cookies.txt"
             wait_enter()
-        elif choice == 3:
+        elif choice == 4:
             cli_check_cookies()
             wait_enter()
-        elif choice == 4:
+        elif choice == 5:
             cli_settings()
             wait_enter()
-        elif choice == 5:
+        elif choice == 6:
             cli_clear_cache()
             wait_enter()
-        elif choice == 6:
+        elif choice == 7:
+            # Сменить папку музыки
+            BASE_MUSIC_DIR = change_music_dir(console)
+            wait_enter()
+        elif choice == 8:
             console.print("\n[ok]Пока![/ok]")
             break
 
 
-
 # ==== NEW (CLI) ====
 def print_banner():
+    music_dir_text = BASE_MUSIC_DIR or "(не задано)"
     console.print(Panel.fit(
         "[title]Spotify Playlist Downloader[/title]\n"
-        "[muted]YouTube via yt-dlp · Selenium cookies helper[/muted]",
+        "[muted]YouTube via yt-dlp · Selenium cookies helper[/muted]\n"
+        f"[dim]Папка музыки:[/dim] {music_dir_text}",
         title="🎵",
         border_style="title"
     ))
@@ -594,13 +637,15 @@ def show_main_menu() -> int:
     table.add_column("#", justify="right", style="muted")
     table.add_column("Действие", style="ok")
     table.add_row("1", "Скачать плейлист по URL")
-    table.add_row("2", "Обновить cookies (ручной вход в YouTube)")
-    table.add_row("3", "Проверить cookies.txt")
-    table.add_row("4", "Настройки")
-    table.add_row("5", "Очистить кеш поиска")
-    table.add_row("6", "Выход")
+    table.add_row("2", "Скачать ОДИН трек (Spotify / YouTube)")
+    table.add_row("3", "Обновить cookies (ручной вход в YouTube)")
+    table.add_row("4", "Проверить cookies.txt")
+    table.add_row("5", "Настройки")
+    table.add_row("6", "Очистить кеш поиска")
+    table.add_row("7", "Изменить папку музыки…")
+    table.add_row("8", "Выход")
     console.print(table)
-    choice = IntPrompt.ask("[title]Выбери пункт[/title]", choices=[str(i) for i in range(1,7)])
+    choice = IntPrompt.ask("[title]Выбери пункт[/title]", choices=[str(i) for i in range(1,9)])
     return choice
 
 def wait_enter():
@@ -622,11 +667,11 @@ def cli_download_playlist(cookies_file: str | None):
         return
 
     console.print(f"[ok]Найдено треков:[/ok] {len(tracks)}")
-    base_dir = f"{playlist_name} ({owner_name})"
-    output_dir = base_dir
+    base_dir_name = f"{playlist_name} ({owner_name})"
+    output_dir = os.path.join(BASE_MUSIC_DIR, base_dir_name)
     counter = 1
     while os.path.exists(output_dir):
-        output_dir = f"{base_dir}_{counter}"
+        output_dir = os.path.join(BASE_MUSIC_DIR, f"{base_dir_name}_{counter}")
         counter += 1
     os.makedirs(output_dir, exist_ok=True)
 
