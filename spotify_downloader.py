@@ -53,8 +53,9 @@ st_set_console(console)
 
 
 CLI_SETTINGS = {
-    "threads": 3,
+    "threads": 4,
     "debug": False,
+    "audio_bitrate_kbps": 320,
 }
 
 SEARCH_CACHE = {}
@@ -68,7 +69,31 @@ COOKIES_NEED_REFRESH = False
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
+def _load_cli_settings_from_config():
+    try:
+        cfg = load_config() or {}
+        st = cfg.get("cli_settings", {})
+        if isinstance(st, dict):
+            if "threads" in st:
+                CLI_SETTINGS["threads"] = int(st["threads"])
+            if "debug" in st:
+                CLI_SETTINGS["debug"] = bool(st["debug"])
+            if "audio_bitrate_kbps" in st:
+                CLI_SETTINGS["audio_bitrate_kbps"] = int(st["audio_bitrate_kbps"])
+    except Exception:
+        pass
 
+def _save_cli_settings_to_config():
+    try:
+        cfg = load_config() or {}
+        cfg["cli_settings"] = {
+            "threads": CLI_SETTINGS["threads"],
+            "debug": CLI_SETTINGS["debug"],
+            "audio_bitrate_kbps": CLI_SETTINGS["audio_bitrate_kbps"],
+        }
+        save_config(cfg)
+    except Exception:
+        pass
 
 def automate_youtube_login(driver, email, password, timeout=30):
     """Устойчивый вход в YouTube/Google-аккаунт"""
@@ -444,7 +469,7 @@ def download_audio(track_info, output_dir, cookies_file=None):
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320',
+            'preferredquality': str(CLI_SETTINGS["audio_bitrate_kbps"]),
         }],
         'quiet': True,
         'no_warnings': True,
@@ -527,6 +552,9 @@ def process_track(args):
 
 def main():
     global BASE_MUSIC_DIR
+    _load_cli_settings_from_config()
+    global DEBUG
+    DEBUG = CLI_SETTINGS["debug"]
 
     BASE_MUSIC_DIR = ensure_music_dir(console)
 
@@ -554,6 +582,7 @@ def main():
                 client_id=CLIENT_ID,
                 client_secret=CLIENT_SECRET,
                 base_music_dir=BASE_MUSIC_DIR,
+                audio_bitrate_kbps=CLI_SETTINGS["audio_bitrate_kbps"],
             )
         elif choice == 3:
             ok = automated_cookies_refresh()
@@ -718,15 +747,76 @@ def cli_check_cookies():
     console.print("[ok]cookies.txt валиден[/ok]" if ok else "[warn]cookies.txt недействителен или устарел[/warn]")
 
 def cli_settings():
-    console.print("\n[title]Настройки[/title]")
-    console.print(f"Текущие: threads={CLI_SETTINGS['threads']}, debug={CLI_SETTINGS['debug']}")
-    if Confirm.ask("Изменить число потоков?"):
-        CLI_SETTINGS["threads"] = IntPrompt.ask("threads", default=CLI_SETTINGS["threads"])
-    if Confirm.ask("Переключить DEBUG?"):
-        CLI_SETTINGS["debug"] = not CLI_SETTINGS["debug"]
-        global DEBUG
-        DEBUG = CLI_SETTINGS["debug"]
-    console.print(f"[ok]Сохранено: threads={CLI_SETTINGS['threads']}, debug={CLI_SETTINGS['debug']}[/ok]")
+    while True:
+        console.clear()
+        console.print(Panel.fit("Настройки", title="⚙️", border_style="title"))
+
+        table = Table(show_header=True, header_style="title")
+        table.add_column("Параметр", style="ok")
+        table.add_column("Значение", style="muted")
+        table.add_row("Потоки загрузки", str(CLI_SETTINGS["threads"]))
+        table.add_row("Качество аудио (kbps)", str(CLI_SETTINGS["audio_bitrate_kbps"]))
+        table.add_row("Режим отладки (DEBUG)", "Вкл" if CLI_SETTINGS["debug"] else "Выкл")
+        console.print(table)
+
+        console.print(
+            "[muted]Пояснения:[/muted]\n"
+            "- [bold]Потоки[/bold]: больше потоков — быстрее, но выше шанс ошибок/ограничений сети.\n"
+            "- [bold]Качество аудио[/bold]: 320 — лучше качество/больше размер; 160 — экономит место.\n"
+            "- [bold]DEBUG[/bold]: подробные логи для диагностики.",
+        )
+
+        m = Table(show_header=True, header_style="title")
+        m.add_column("#", justify="right", style="muted")
+        m.add_column("Действие", style="ok")
+        m.add_row("1", "Изменить число потоков")
+        m.add_row("2", "Выбрать качество аудио (1=320, 2=160)")
+        m.add_row("3", "Переключить DEBUG")
+        m.add_row("4", "Назад")
+        console.print(m)
+
+        try:
+            choice = IntPrompt.ask("Выбери пункт", choices=["1","2","3","4"])
+        except Exception:
+            return
+
+        if choice == 1:
+            cpu = os.cpu_count() or 4
+            max_threads = max(1, min(16, cpu * 2))
+            console.print(f"[muted]Допустимо от 1 до {max_threads}[/muted]")
+            while True:
+                try:
+                    new_threads = IntPrompt.ask("Сколько потоков использовать?",
+                                                default=CLI_SETTINGS["threads"])
+                except Exception:
+                    break
+                if 1 <= new_threads <= max_threads:
+                    CLI_SETTINGS["threads"] = new_threads
+                    _save_cli_settings_to_config()
+                    console.print(f"[ok]Сохранено: threads={new_threads}[/ok]")
+                    break
+                else:
+                    console.print(f"[warn]Укажи число от 1 до {max_threads}[/warn]")
+
+        elif choice == 2:
+            console.print("[muted]1 = 320 kbps (лучшее качество), 2 = 160 kbps (экономия места)[/muted]")
+            sel = IntPrompt.ask("Выбор качества", choices=["1","2"],
+                                default="1" if CLI_SETTINGS["audio_bitrate_kbps"] == 320 else "2")
+            CLI_SETTINGS["audio_bitrate_kbps"] = 320 if sel == 1 else 160
+            _save_cli_settings_to_config()
+            console.print(f"[ok]Сохранено: audio_bitrate_kbps={CLI_SETTINGS['audio_bitrate_kbps']}[/ok]")
+
+        elif choice == 3:
+            CLI_SETTINGS["debug"] = not CLI_SETTINGS["debug"]
+            global DEBUG
+            DEBUG = CLI_SETTINGS["debug"]
+            _save_cli_settings_to_config()
+            console.print(f"[ok]DEBUG {'включен' if DEBUG else 'выключен'}[/ok]")
+
+        elif choice == 4:
+            break
+
+        Prompt.ask("\n[muted]Enter — вернуться в меню настроек[/muted]", default="", show_default=False)
 
 def cli_clear_cache():
     SEARCH_CACHE.clear()

@@ -317,7 +317,7 @@ def _write_metadata(mp3_path: str, track_info: dict):
 
     audio.save(v2_version=3)
 
-def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cookies_file: Optional[str]) -> Tuple[bool, Optional[str]]:
+def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cookies_file: Optional[str], bitrate_kbps: int) -> Tuple[bool, Optional[str]]:
     video_url = normalize_youtube_url(entry.get("url") or "")
     if not video_url:
         return False, "У выбранного результата нет URL"
@@ -326,7 +326,7 @@ def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cooki
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}],
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320", "preferredquality": str(bitrate_kbps),}],
         "quiet": True,
         "no_warnings": True,
         "retries": 3,
@@ -358,9 +358,9 @@ def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cooki
     else:
         return False, "Файл mp3 не найден после скачивания"
 
-def download_audio_by_url(youtube_url: str, track_info: dict, out_dir: str, cookies_file: Optional[str]) -> Tuple[bool, Optional[str]]:
+def download_audio_by_url(youtube_url: str, track_info: dict, out_dir: str, cookies_file: Optional[str], bitrate_kbps: int) -> Tuple[bool, Optional[str]]:
     youtube_url = normalize_youtube_url(youtube_url)
-    return download_audio_from_entry(track_info, {"url": youtube_url}, out_dir, cookies_file)
+    return download_audio_from_entry(track_info, {"url": youtube_url}, out_dir, cookies_file, bitrate_kbps)
 
 
 # ---------- Top-level CLI ----------
@@ -371,6 +371,7 @@ def cli_download_single_track(
     client_id: str,
     client_secret: str,
     base_music_dir: str,
+    audio_bitrate_kbps: int,
 ):
     global sanitize_filename
     sanitize_filename = sanitize_filename_func
@@ -475,7 +476,7 @@ def cli_download_single_track(
                 return
 
             page("Один трек • Spotify", "[muted]Скачивание и тегирование...[/muted]")
-            ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file)
+            ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file, audio_bitrate_kbps)
             if ok:
                 page("Один трек • Spotify", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
                 Prompt.ask("", default="", show_default=False)
@@ -543,7 +544,7 @@ def cli_download_single_track(
             return
 
         page("Один трек • YouTube", "[muted]Скачивание и тегирование...[/muted]")
-        ok, err = download_audio_by_url(info["url"], track_info, target_dir, cookies_file)
+        ok, err = download_audio_by_url(info["url"], track_info, target_dir, cookies_file, audio_bitrate_kbps)
         if ok:
             page("Один трек • YouTube", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
             Prompt.ask("", default="", show_default=False)
