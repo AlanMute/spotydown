@@ -5,7 +5,7 @@ from rich.table import Table
 from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-
+from mutagen.flac import FLAC, Picture
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, error
 import urllib.request
@@ -14,13 +14,9 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from urllib.parse import urlparse, parse_qs
 from io import BytesIO
-from urllib.parse import urlparse
 
 console: Console
 sanitize_filename = None
-
-COVER_SIZE = 640                
-COVER_MAX_BYTES = 400 * 1024
 
 def normalize_youtube_url(url: str) -> str:
     """
@@ -273,69 +269,74 @@ def _fetch_cover_bytes(url: str) -> tuple[bytes, str, str]:
     except Exception:
         return b"", "", ""
 
-def _write_metadata(mp3_path: str, track_info: dict):
-    audio = MP3(mp3_path, ID3=ID3)
-    try:
-        audio.add_tags()
-    except error:
-        pass
-
-    try:
-        for key in list(audio.tags.keys()):
-            if key.startswith("APIC"):
-                del audio.tags[key]
-    except Exception:
-        pass
-
+def _write_metadata_unified(audio_path: str, track_info: dict):
+    ext = os.path.splitext(audio_path)[1].lower()
     title  = track_info.get("title", "") or ""
     artist = track_info.get("artist", "") or ""
     album  = track_info.get("album", "") or ""
+    cover_url = track_info.get("cover_url") or ""
 
-    audio.tags.add(TIT2(encoding=3, text=title))
-    audio.tags.add(TPE1(encoding=3, text=artist))
-    audio.tags.add(TALB(encoding=3, text=album))
+    # нормализуем обложку (у тебя уже есть _fetch_cover_bytes -> JPEG 640x640)
+    data, mime, _ = _fetch_cover_bytes(cover_url)
 
-    cover_url = track_info.get("cover_url")
-    if cover_url:
-        data, mime, ext = _fetch_cover_bytes(cover_url)
+    if ext == ".mp3":
+        audio = MP3(audio_path, ID3=ID3)
+        try: audio.add_tags()
+        except error: pass
+        try:
+            for k in list(audio.tags.keys()):
+                if k.startswith("APIC"): del audio.tags[k]
+        except Exception: pass
+        audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text=artist))
+        audio.tags.add(TALB(encoding=3, text=album))
         if data and mime:
-            covers_dir = os.path.join(os.path.dirname(mp3_path), "covers")
-            os.makedirs(covers_dir, exist_ok=True)
-            cover_file = os.path.join(
-                covers_dir,
-                f"{sanitize_filename(artist)} - {sanitize_filename(title)}.{ext}"
-            )
+            try: audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+            except Exception: pass
+        audio.save(v2_version=3)
+
+    elif ext == ".flac":
+        audio = FLAC(audio_path)
+        audio["title"]  = title
+        audio["artist"] = artist
+        audio["album"]  = album
+        try: audio.clear_pictures()
+        except Exception: pass
+        if data and mime:
             try:
-                with open(cover_file, "wb") as f:
-                    f.write(data)
+                pic = Picture()
+                pic.type = 3
+                pic.desc = "Cover"
+                pic.mime = mime
+                pic.data = data
+                audio.add_picture(pic)
             except Exception:
                 pass
-            try:
-                audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
-            except Exception:
-                pass
+        audio.save()
 
-    audio.save(v2_version=3)
-
-def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cookies_file: Optional[str], bitrate_kbps: int) -> Tuple[bool, Optional[str]]:
+def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str,
+                              cookies_file: Optional[str],
+                              bitrate_kbps: int,
+                              audio_format: str) -> Tuple[bool, Optional[str]]:
     video_url = normalize_youtube_url(entry.get("url") or "")
     if not video_url:
         return False, "У выбранного результата нет URL"
 
+    final_ext = "mp3" if audio_format == "mp3" else "flac"
     outtmpl = os.path.join(out_dir, f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.%(ext)s")
+
+    pp = {"key": "FFmpegExtractAudio", "preferredcodec": audio_format}
+    if audio_format == "mp3":
+        pp["preferredquality"] = str(bitrate_kbps)
+
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320", "preferredquality": str(bitrate_kbps),}],
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "continuedl": True,
-        "skip_unavailable_fragments": True,
-        "socket_timeout": 30,
-        "prefer_ipv4": True,
-        "noplaylist": True, 
+        "postprocessors": [pp],
+        "quiet": True, "no_warnings": True,
+        "retries": 3, "fragment_retries": 3, "continuedl": True,
+        "skip_unavailable_fragments": True, "socket_timeout": 30,
+        "prefer_ipv4": True, "noplaylist": True,
     }
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts["cookiefile"] = cookies_file
@@ -348,19 +349,22 @@ def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str, cooki
     except Exception as e:
         return False, str(e)
 
-    mp3_path = os.path.join(out_dir, f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.mp3")
-    if os.path.exists(mp3_path):
+    # итоговый путь с выбранным расширением
+    out_path = os.path.join(out_dir, f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.{final_ext}")
+    if os.path.exists(out_path):
         try:
-            _write_metadata(mp3_path, track_info)
+            _write_metadata_unified(out_path, track_info)  # см. ниже
         except Exception as e:
             return False, f"Скачалось, но метаданные не записались: {e}"
         return True, None
     else:
-        return False, "Файл mp3 не найден после скачивания"
+        return False, f"Файл не найден после скачивания ({final_ext})"
 
-def download_audio_by_url(youtube_url: str, track_info: dict, out_dir: str, cookies_file: Optional[str], bitrate_kbps: int) -> Tuple[bool, Optional[str]]:
+def download_audio_by_url(youtube_url: str, track_info: dict, out_dir: str,
+                          cookies_file: Optional[str],
+                          bitrate_kbps: int, audio_format: str) -> Tuple[bool, Optional[str]]:
     youtube_url = normalize_youtube_url(youtube_url)
-    return download_audio_from_entry(track_info, {"url": youtube_url}, out_dir, cookies_file, bitrate_kbps)
+    return download_audio_from_entry(track_info, {"url": youtube_url}, out_dir, cookies_file, bitrate_kbps, audio_format)
 
 
 # ---------- Top-level CLI ----------
@@ -372,6 +376,7 @@ def cli_download_single_track(
     client_secret: str,
     base_music_dir: str,
     audio_bitrate_kbps: int,
+    audio_format: str,
 ):
     global sanitize_filename
     sanitize_filename = sanitize_filename_func
@@ -476,7 +481,8 @@ def cli_download_single_track(
                 return
 
             page("Один трек • Spotify", "[muted]Скачивание и тегирование...[/muted]")
-            ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file, audio_bitrate_kbps)
+            ok, err = download_audio_from_entry(track_info, chosen, target_dir, cookies_file,
+                                    audio_bitrate_kbps, audio_format)
             if ok:
                 page("Один трек • Spotify", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
                 Prompt.ask("", default="", show_default=False)
@@ -544,7 +550,8 @@ def cli_download_single_track(
             return
 
         page("Один трек • YouTube", "[muted]Скачивание и тегирование...[/muted]")
-        ok, err = download_audio_by_url(info["url"], track_info, target_dir, cookies_file, audio_bitrate_kbps)
+        ok, err = download_audio_by_url(info["url"], track_info, target_dir, cookies_file,
+                                audio_bitrate_kbps, audio_format)
         if ok:
             page("Один трек • YouTube", f"[bold green]Готово![/bold green]\n[dim]Файл в папке:[/dim] {target_dir}\n\n[dim]Enter для возврата[/dim]")
             Prompt.ask("", default="", show_default=False)

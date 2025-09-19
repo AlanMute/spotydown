@@ -5,23 +5,21 @@ from spotipy.oauth2 import SpotifyClientCredentials
 import yt_dlp as youtube_dl
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, error
+from mutagen.flac import FLAC, Picture
 import urllib.request
-import concurrent.futures
-import argparse
 import time
 from difflib import SequenceMatcher
 import threading
 import json
 from http.cookiejar import MozillaCookieJar
-import selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 import undetected_chromedriver as uc
-import tempfile
-import shutil
+from PIL import Image, ImageOps
+from io import BytesIO 
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -33,6 +31,7 @@ from single_track_cli import (
     cli_download_single_track,
 )
 from app_config import ensure_music_dir, change_music_dir, load_config, save_config
+
 
 
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
@@ -51,12 +50,15 @@ THEME = Theme({
 console = Console(theme=THEME)
 st_set_console(console)
 
-
 CLI_SETTINGS = {
     "threads": 4,
     "debug": False,
     "audio_bitrate_kbps": 320,
+    "audio_format": "mp3",
 }
+
+COVER_SIZE = 640                
+COVER_MAX_BYTES = 400 * 1024
 
 SEARCH_CACHE = {}
 
@@ -74,12 +76,10 @@ def _load_cli_settings_from_config():
         cfg = load_config() or {}
         st = cfg.get("cli_settings", {})
         if isinstance(st, dict):
-            if "threads" in st:
-                CLI_SETTINGS["threads"] = int(st["threads"])
-            if "debug" in st:
-                CLI_SETTINGS["debug"] = bool(st["debug"])
-            if "audio_bitrate_kbps" in st:
-                CLI_SETTINGS["audio_bitrate_kbps"] = int(st["audio_bitrate_kbps"])
+            if "threads" in st: CLI_SETTINGS["threads"] = int(st["threads"])
+            if "debug" in st: CLI_SETTINGS["debug"] = bool(st["debug"])
+            if "audio_bitrate_kbps" in st: CLI_SETTINGS["audio_bitrate_kbps"] = int(st["audio_bitrate_kbps"])
+            if "audio_format" in st: CLI_SETTINGS["audio_format"] = str(st["audio_format"]).lower()
     except Exception:
         pass
 
@@ -90,6 +90,7 @@ def _save_cli_settings_to_config():
             "threads": CLI_SETTINGS["threads"],
             "debug": CLI_SETTINGS["debug"],
             "audio_bitrate_kbps": CLI_SETTINGS["audio_bitrate_kbps"],
+            "audio_format": CLI_SETTINGS["audio_format"],
         }
         save_config(cfg)
     except Exception:
@@ -448,29 +449,34 @@ def find_best_match(track_info, ydl_opts, cookies_file=None):
 
 def download_audio(track_info, output_dir, cookies_file=None):
     global COOKIES_NEED_REFRESH
-    
+
     info_ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
     }
-    
     best_match = find_best_match(track_info, info_ydl_opts, cookies_file)
-    
     if not best_match or 'url' not in best_match:
         print(f"Не удалось найти видео для: {track_info['artist']} - {track_info['title']}")
         return False
-    
+
     video_url = best_match['url']
-    
+
+    codec = str(CLI_SETTINGS.get("audio_format", "mp3")).lower() 
+    pp = {
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': codec,
+    }
+    if codec == 'mp3':
+        pp['preferredquality'] = str(CLI_SETTINGS.get("audio_bitrate_kbps", 320))
+
     download_ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': os.path.join(output_dir, f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.%(ext)s"),
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': str(CLI_SETTINGS["audio_bitrate_kbps"]),
-        }],
+        'outtmpl': os.path.join(
+            output_dir,
+            f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.%(ext)s"
+        ),
+        'postprocessors': [pp],
         'quiet': True,
         'no_warnings': True,
         'socket_timeout': 30,
@@ -479,10 +485,10 @@ def download_audio(track_info, output_dir, cookies_file=None):
         'skip_unavailable_fragments': True,
         'continuedl': True,
     }
-    
+
     if cookies_file and os.path.exists(cookies_file):
         download_ydl_opts['cookiefile'] = cookies_file
-    
+
     try:
         with youtube_dl.YoutubeDL(download_ydl_opts) as ydl:
             ydl.download([video_url])
@@ -497,40 +503,105 @@ def download_audio(track_info, output_dir, cookies_file=None):
             print(f"Ошибка загрузки {track_info['title']}: {error_msg}")
             return False
 
-def add_metadata(track_info, file_path):
+def _normalize_cover_jpeg(cover_url: str) -> tuple[bytes, str, str]:
+    """Качаем картинку, центр-кроп до 640x640, сохраняем baseline JPEG < ~400KB.
+       Возвращаем (bytes, mime, ext). Пустые строки — если не получилось.
+    """
+    if not cover_url:
+        return b"", "", ""
     try:
-        audio = MP3(file_path, ID3=ID3)
+        req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except Exception:
+        return b"", "", ""
+    try:
+        img = Image.open(BytesIO(raw))
         try:
-            audio.add_tags()
-        except error:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
             pass
-        
-        audio.tags.add(TIT2(encoding=3, text=track_info['title']))
-        audio.tags.add(TPE1(encoding=3, text=track_info['artist']))
-        audio.tags.add(TALB(encoding=3, text=track_info['album']))
-        
-        if track_info['cover_url']:
-            cover_path = os.path.join(os.path.dirname(file_path), "covers")
-            os.makedirs(cover_path, exist_ok=True)
-            cover_filename = f"{sanitize_filename(track_info['artist'])} - {sanitize_filename(track_info['title'])}.jpg"
-            cover_filepath = os.path.join(cover_path, cover_filename)
-            
-            if not os.path.exists(cover_filepath):
-                with urllib.request.urlopen(track_info['cover_url']) as img:
-                    with open(cover_filepath, 'wb') as f:
-                        f.write(img.read())
-            
-            with open(cover_filepath, 'rb') as img:
-                audio.tags.add(APIC(
-                    encoding=3,
-                    mime='image/jpeg',
-                    type=3,
-                    desc='Cover',
-                    data=img.read()
-                ))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top  = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+        if img.size != (COVER_SIZE, COVER_SIZE):
+            img = img.resize((COVER_SIZE, COVER_SIZE), Image.LANCZOS)
+
+        def enc(q):
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True, progressive=False, subsampling="4:2:0")
+            return buf.getvalue()
+
+        q = 88
+        out = enc(q)
+        while len(out) > COVER_MAX_BYTES and q > 60:
+            q -= 6
+            out = enc(q)
+        return out, "image/jpeg", "jpg"
+    except Exception:
+        return b"", "", ""
+    
+def write_tags_unified(file_path: str, track_info: dict):
+    """Записывает теги и обложку для MP3 или FLAC в зависимости от расширения файла."""
+    ext = os.path.splitext(file_path)[1].lower()
+    title  = track_info.get("title", "") or ""
+    artist = track_info.get("artist", "") or ""
+    album  = track_info.get("album", "") or ""
+    cover_url = track_info.get("cover_url") or ""
+
+    cover_bytes, cover_mime, cover_ext = _normalize_cover_jpeg(cover_url)
+
+    if ext == ".mp3":
+        audio = MP3(file_path, ID3=ID3)
+        try: audio.add_tags()
+        except error: pass
+
+        try:
+            for key in list(audio.tags.keys()):
+                if key.startswith("APIC"):
+                    del audio.tags[key]
+        except Exception:
+            pass
+
+        audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text=artist))
+        audio.tags.add(TALB(encoding=3, text=album))
+
+        if cover_bytes:
+            try:
+                audio.tags.add(APIC(encoding=3, mime=cover_mime, type=3, desc="Cover", data=cover_bytes))
+            except Exception:
+                pass
+
         audio.save(v2_version=3)
-    except Exception as e:
-        print(f"Ошибка добавления метаданных для {track_info['title']}: {str(e)}")
+
+    elif ext == ".flac":
+        audio = FLAC(file_path)
+        audio["title"]  = title
+        audio["artist"] = artist
+        audio["album"]  = album
+
+        try:
+            audio.clear_pictures()
+        except Exception:
+            pass
+
+        if cover_bytes:
+            try:
+                pic = Picture()
+                pic.type = 3  
+                pic.desc = "Cover"
+                pic.mime = cover_mime  
+                pic.data = cover_bytes
+                audio.add_picture(pic)
+            except Exception:
+                pass
+
+        audio.save()
 
 def process_track(args):
     idx, track, total, output_dir, cookies_file = args
@@ -538,10 +609,11 @@ def process_track(args):
     
     result = download_audio(track, output_dir, cookies_file)
     if result is True:
-        file_name = f"{sanitize_filename(track['artist'])} - {sanitize_filename(track['title'])}.mp3"
+        final_ext = "mp3" if CLI_SETTINGS.get("audio_format", "mp3") == "mp3" else "flac"
+        file_name = f"{sanitize_filename(track['artist'])} - {sanitize_filename(track['title'])}.{final_ext}"
         file_path = os.path.join(output_dir, file_name)
         if os.path.exists(file_path):
-            add_metadata(track, file_path)
+            write_tags_unified(file_path, track)
             return None
         else:
             return f"{track['artist']} - {track['title']} (файл не создан)"
@@ -575,7 +647,6 @@ def main():
         elif choice == 1:
             cli_download_playlist(cookies_file)
         elif choice == 2:
-            from single_track_cli import cli_download_single_track
             cli_download_single_track(
                 cookies_file=cookies_file,
                 sanitize_filename_func=sanitize_filename,
@@ -583,6 +654,7 @@ def main():
                 client_secret=CLIENT_SECRET,
                 base_music_dir=BASE_MUSIC_DIR,
                 audio_bitrate_kbps=CLI_SETTINGS["audio_bitrate_kbps"],
+                audio_format=CLI_SETTINGS["audio_format"],
             )
         elif choice == 3:
             ok = automated_cookies_refresh()
@@ -605,13 +677,13 @@ def main():
 def show_main_menu() -> int:
     subtitle = f"[dim]Папка музыки:[/dim] {BASE_MUSIC_DIR or '(не задано)'}"
     options = [
-        "Скачать плейлист по URL",
+        "Скачать плейлист Spotify по URL",
         "Скачать ОДИН трек (Spotify / YouTube)",
         "Обновить cookies (ручной вход в YouTube)",
         "Проверить cookies.txt",
         "Настройки",
         "Очистить кеш поиска",
-        "Изменить папку музыки…",
+        "Изменить папку музыки",
     ]
     choice = ui_menu("Spotify Playlist Downloader", options, subtitle, back_text="⏻ Выход")
     return choice
@@ -755,68 +827,73 @@ def cli_settings():
         table.add_column("Параметр", style="ok")
         table.add_column("Значение", style="muted")
         table.add_row("Потоки загрузки", str(CLI_SETTINGS["threads"]))
+        table.add_row("Формат аудио", CLI_SETTINGS["audio_format"])
         table.add_row("Качество аудио (kbps)", str(CLI_SETTINGS["audio_bitrate_kbps"]))
         table.add_row("Режим отладки (DEBUG)", "Вкл" if CLI_SETTINGS["debug"] else "Выкл")
         console.print(table)
 
         console.print(
             "[muted]Пояснения:[/muted]\n"
-            "- [bold]Потоки[/bold]: больше потоков — быстрее, но выше шанс ошибок/ограничений сети.\n"
-            "- [bold]Качество аудио[/bold]: 320 — лучше качество/больше размер; 160 — экономит место.\n"
-            "- [bold]DEBUG[/bold]: подробные логи для диагностики.",
+            "- [bold]Потоки[/bold]: больше — быстрее, но выше шанс ошибок.\n"
+            "- [bold]Формат[/bold]: mp3 (с потерями) / flac (без потерь).\n"
+            "- [bold]Качество[/bold]: влияет только на MP3 (320 лучше, 160 экономит место).\n"
+            "- [bold]DEBUG[/bold]: подробные логи.",
         )
 
         m = Table(show_header=True, header_style="title")
         m.add_column("#", justify="right", style="muted")
         m.add_column("Действие", style="ok")
         m.add_row("1", "Изменить число потоков")
-        m.add_row("2", "Выбрать качество аудио (1=320, 2=160)")
-        m.add_row("3", "Переключить DEBUG")
-        m.add_row("4", "Назад")
+        m.add_row("2", "Выбрать ФОРМАТ аудио (1=mp3, 2=flac)")
+        m.add_row("3", "Выбрать КАЧЕСТВО для MP3 (1=320, 2=160)")
+        m.add_row("4", "Переключить DEBUG")
+        m.add_row("5", "Назад")
         console.print(m)
 
-        try:
-            choice = IntPrompt.ask("Выбери пункт", choices=["1","2","3","4"])
-        except Exception:
-            return
+        choice = IntPrompt.ask("Выбери пункт", choices=["1","2","3","4","5"])
 
         if choice == 1:
             cpu = os.cpu_count() or 4
             max_threads = max(1, min(16, cpu * 2))
             console.print(f"[muted]Допустимо от 1 до {max_threads}[/muted]")
             while True:
-                try:
-                    new_threads = IntPrompt.ask("Сколько потоков использовать?",
-                                                default=CLI_SETTINGS["threads"])
-                except Exception:
-                    break
+                new_threads = IntPrompt.ask("Сколько потоков использовать?", default=CLI_SETTINGS["threads"])
                 if 1 <= new_threads <= max_threads:
                     CLI_SETTINGS["threads"] = new_threads
                     _save_cli_settings_to_config()
                     console.print(f"[ok]Сохранено: threads={new_threads}[/ok]")
                     break
-                else:
-                    console.print(f"[warn]Укажи число от 1 до {max_threads}[/warn]")
+                console.print(f"[warn]Укажи число от 1 до {max_threads}[/warn]")
 
         elif choice == 2:
-            console.print("[muted]1 = 320 kbps (лучшее качество), 2 = 160 kbps (экономия места)[/muted]")
-            sel = IntPrompt.ask("Выбор качества", choices=["1","2"],
+            console.print("[muted]1 = mp3 (с потерями), 2 = flac (без потерь)[/muted]")
+            sel = IntPrompt.ask("Формат", choices=["1","2"],
+                                default="1" if CLI_SETTINGS["audio_format"] == "mp3" else "2")
+            CLI_SETTINGS["audio_format"] = "mp3" if sel == 1 else "flac"
+            _save_cli_settings_to_config()
+            console.print(f"[ok]Сохранено: формат = {CLI_SETTINGS['audio_format']}[/ok]")
+
+        elif choice == 3:
+            if CLI_SETTINGS["audio_format"] != "mp3":
+                console.print("[warn]Качество влияет только на MP3. Для FLAC игнорируется.[/warn]")
+            sel = IntPrompt.ask("Качество MP3", choices=["1","2"],
                                 default="1" if CLI_SETTINGS["audio_bitrate_kbps"] == 320 else "2")
             CLI_SETTINGS["audio_bitrate_kbps"] = 320 if sel == 1 else 160
             _save_cli_settings_to_config()
-            console.print(f"[ok]Сохранено: audio_bitrate_kbps={CLI_SETTINGS['audio_bitrate_kbps']}[/ok]")
+            console.print(f"[ok]Сохранено: {CLI_SETTINGS['audio_bitrate_kbps']} kbps[/ok]")
 
-        elif choice == 3:
+        elif choice == 4:
             CLI_SETTINGS["debug"] = not CLI_SETTINGS["debug"]
             global DEBUG
             DEBUG = CLI_SETTINGS["debug"]
             _save_cli_settings_to_config()
             console.print(f"[ok]DEBUG {'включен' if DEBUG else 'выключен'}[/ok]")
 
-        elif choice == 4:
+        elif choice == 5:
             break
 
         Prompt.ask("\n[muted]Enter — вернуться в меню настроек[/muted]", default="", show_default=False)
+
 
 def cli_clear_cache():
     SEARCH_CACHE.clear()
