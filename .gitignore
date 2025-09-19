@@ -1,3 +1,8 @@
 cookies.txt
 .cache
 __pycache__/
+
+build/
+dist/
+installer/SpotyDown.iss
+spotify_downloader.spec

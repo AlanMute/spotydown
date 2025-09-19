@@ -14,6 +14,7 @@ import json
 from http.cookiejar import MozillaCookieJar
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+import concurrent.futures
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
@@ -31,7 +32,9 @@ from single_track_cli import (
     cli_download_single_track,
 )
 from app_config import ensure_music_dir, change_music_dir, load_config, save_config
-
+from rich import box
+import sys
+from app_config import ensure_music_dir, change_music_dir, load_config, save_config, _config_dir
 
 
 CLIENT_ID = '77bb678c39844763a230d7452c3b3f5e'
@@ -47,7 +50,9 @@ THEME = Theme({
     "title": "bold cyan",
     "muted": "dim",
 })
-console = Console(theme=THEME)
+IS_WIN = os.name == "nt"
+BOX_STYLE = box.SIMPLE if IS_WIN else box.ROUNDED
+console = Console(theme=THEME, emoji=True, legacy_windows=False)
 st_set_console(console)
 
 CLI_SETTINGS = {
@@ -67,6 +72,60 @@ cookies_last_checked = 0
 COOKIES_CHECK_INTERVAL = 1800  
 
 COOKIES_NEED_REFRESH = False
+
+def app_dir() -> str:
+    # Папка, где лежит .exe (frozen) или .py
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def cookie_candidates() -> list[str]:
+    # 1) Папка приложения, 2) %APPDATA%\SpotifyPlaylistDownloader, 3) текущая папка (фолбэк)
+    return [
+        os.path.join(app_dir(), "cookies.txt"),
+        os.path.join(_config_dir(), "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+    ]
+
+def find_cookie_file() -> str | None:
+    for p in cookie_candidates():
+        if os.path.exists(p):
+            return p
+    return None
+
+def cookie_default_path() -> str:
+    # Куда сохранять НОВЫЕ cookies: в {app}, если можно писать; иначе в %APPDATA%
+    try:
+        test = os.path.join(app_dir(), ".wtest")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("")
+        os.remove(test)
+        return os.path.join(app_dir(), "cookies.txt")
+    except Exception:
+        return os.path.join(_config_dir(), "cookies.txt")
+    
+def clear_screen():
+    """
+    Агрессивно чистит экран и скроллбэк.
+    Работает надёжнее, чем один лишь console.clear().
+    """
+    # ANSI: очистить экран + скроллбэк и перейти в левый верхний угол
+    try:
+        console.print("\033[2J\033[3J\033[H", end="")
+        console.file.flush()
+    except Exception:
+        pass
+    # Rich (на всякий случай)
+    try:
+        console.clear()
+    except Exception:
+        pass
+    # Windows fallback (если ANSI вдруг не сработал)
+    if os.name == "nt":
+        try:
+            os.system("cls")
+        except Exception:
+            pass
 
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name)
@@ -250,9 +309,9 @@ def automated_cookies_refresh():
         except Exception:
             print("Не нашёл иконку профиля. Всё равно попробую сохранить cookies...")
 
-        cookies_path = "cookies.txt"
+        cookies_path = find_cookie_file() or cookie_default_path()
         if export_cookies_selenium(driver, cookies_path):
-            print("Cookies успешно обновлены и сохранены в cookies.txt!")
+            print(f"Cookies успешно обновлены и сохранены в: {cookies_path}")
             return True
         else:
             print("Не удалось экспортировать cookies.")
@@ -302,22 +361,21 @@ def refresh_cookies():
     if response == '1':
         return automated_cookies_refresh()
     elif response == '2':
-        print("\nПожалуйста, обновите куки файл вручную:")
-        print("1. Убедитесь, что вы вошли в аккаунт YouTube в браузере")
-        print("2. Экспортируйте куки с помощью расширения 'Get cookies.txt LOCALLY'")
-        print("3. Сохраните файл как 'cookies.txt' в папке со скриптом")
-        print("4. Нажмите Enter для продолжения")
+        target = find_cookie_file() or cookie_default_path()
+        folder = os.path.dirname(target)
+        print("\nПожалуйста, обнови cookies вручную:")
+        print(f"1) Войди в YouTube в браузере")
+        print("2) Экспортируй cookies через расширение 'Get cookies.txt LOCALLY'")
+        print(f"3) Сохрани файл как 'cookies.txt' в папку:\n   {folder}")
+        print("4) Нажми Enter для продолжения")
         input()
-        
-        if os.path.exists('cookies.txt') and check_cookies_validity('cookies.txt'):
-            print("Новые куки успешно загружены!")
+
+        if os.path.exists(target) and check_cookies_validity(target):
+            print(f"Новые куки успешно загружены: {target}")
             return True
         else:
-            print("Не удалось найти valid куки файл. Продолжаем без куки...")
+            print("Не удалось найти валидный cookies.txt. Продолжаем без куки...")
             return False
-    else:
-        print("Продолжаем без куки...")
-        return False
 
 def get_spotify_playlist_info(playlist_url):
     auth_manager = SpotifyClientCredentials(client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
@@ -632,11 +690,13 @@ def main():
 
     cookies_file = None
     if not CLI_SETTINGS.get("no_cookies", False):
-        if os.path.exists('cookies.txt'):
-            cookies_file = 'cookies.txt'
-            console.print("[muted]Найден cookies.txt[/muted]")
+        cookies_file = find_cookie_file()
+        if cookies_file:
+            console.print(f"[muted]Найден cookies.txt:[/muted] {cookies_file}")
             if not check_cookies_validity(cookies_file):
                 console.print("[warn]cookies.txt недействителен или устарел[/warn]")
+        else:
+            console.print("[muted]cookies.txt не найден[/muted]")
 
 
     while True:
@@ -659,7 +719,7 @@ def main():
         elif choice == 3:
             ok = automated_cookies_refresh()
             if ok:
-                cookies_file = "cookies.txt"
+                cookies_file = find_cookie_file() or cookie_default_path()
         elif choice == 4:
             cli_check_cookies()
             Prompt.ask("\n[dim]Enter для возврата[/dim]", default="", show_default=False)
@@ -743,7 +803,8 @@ def cli_download_playlist(cookies_file: str | None):
         for track in tracks:
             find_best_match(track, info_ydl_opts, cookies_file)
             progress.update(t1, advance=1)
-
+    
+    clear_screen()
     # 2) Загрузка
     ui_page("Скачать плейлист", "[title]Загрузка аудио[/title]")
     failed_tracks = []
@@ -781,6 +842,7 @@ def cli_download_playlist(cookies_file: str | None):
 
                 age_restricted_tracks = []
 
+                clear_screen()
                 ui_page("Скачать плейлист", "[title]Повторная загрузка[/title]")
                 with Progress(
                     SpinnerColumn(),
@@ -811,12 +873,14 @@ def cli_download_playlist(cookies_file: str | None):
 
 # ==== NEW (CLI) ====
 def cli_check_cookies():
-    path = "cookies.txt"
-    if not os.path.exists(path):
+    path = find_cookie_file()
+    if not path:
         console.print("[warn]cookies.txt не найден[/warn]")
+        console.print("[muted]Искал в:[/muted]\n" + "\n".join(f" • {p}" for p in cookie_candidates()))
         return
     ok = check_cookies_validity(path)
-    console.print("[ok]cookies.txt валиден[/ok]" if ok else "[warn]cookies.txt недействителен или устарел[/warn]")
+    console.print(f"[ok]cookies.txt валиден[/ok] [dim]({path})[/dim]" if ok else f"[warn]cookies.txt недействителен или устарел[/warn] [dim]({path})[/dim]")
+
 
 def cli_settings():
     while True:
@@ -900,22 +964,18 @@ def cli_clear_cache():
     console.print("[ok]Кеш поиска очищен[/ok]")
 
 def ui_page(title: str, subtitle: str | None = None):
-    """Чистит консоль и рисует «страницу» с заголовком и пояснением."""
-    console.clear()
+    clear_screen()
     console.print(Panel.fit(
         (subtitle or ""),
         title=title,
         border_style="title"
     ))
 
-def ui_menu(title: str, options: list[str], subtitle: str | None = None, back_text: str = "⟵ Назад") -> int:
-    """
-    Рисует страницу-меню. Возвращает выбранный номер:
-      0 — «Назад», 1..N — пункт из options.
-    """
+def ui_menu(title: str, options: list[str], subtitle: str | None = None, back_text: str = "Назад") -> int:
     ui_page(title, subtitle)
-    table = Table(show_header=True, header_style="title")
-    table.add_column("#", justify="right", style="muted", width=3)
+    width = min((console.size.width or 100) - 2, 100)
+    table = Table(show_header=True, header_style="title", box=BOX_STYLE, width=width)
+    table.add_column("#", justify="right", style="muted", width=3, no_wrap=True)
     table.add_column("Действие", style="ok")
     table.add_row("0", back_text)
     for i, opt in enumerate(options, start=1):

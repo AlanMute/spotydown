@@ -14,9 +14,30 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from urllib.parse import urlparse, parse_qs
 from io import BytesIO
+from rich import box
+import sys
+
+COVER_SIZE = 640
+COVER_MAX_BYTES = 400 * 1024
 
 console: Console
 sanitize_filename = None
+
+def clear_screen():
+    try:
+        console.print("\033[2J\033[3J\033[H", end="")
+        console.file.flush()
+    except Exception:
+        pass
+    try:
+        console.clear()
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            os.system("cls")
+        except Exception:
+            pass
 
 def normalize_youtube_url(url: str) -> str:
     """
@@ -43,8 +64,11 @@ def set_console(c: Console):
     global console
     console = c
 
+IS_WIN = os.name == "nt"
+BOX_STYLE = box.SIMPLE if IS_WIN else box.ROUNDED
+
 def page(title: str, subtitle: str | None = None):
-    console.clear()
+    clear_screen()
     console.print(Panel.fit(subtitle or "", title=title, border_style="title"))
 
 # ---------- Spotify helpers ----------
@@ -81,8 +105,6 @@ def yt_search_for_track(track_info: dict, cookies_file: Optional[str], limit: in
     opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
     if cookies_file and os.path.exists(cookies_file):
         opts["cookiefile"] = cookies_file
-    else:
-        opts["cookiesfrombrowser"] = ("chrome",)
 
     seen_urls = set()
     collected: List[dict] = []
@@ -124,8 +146,6 @@ def yt_get_video_info(url: str, cookies_file: Optional[str]) -> Optional[dict]:
     }
     if cookies_file and os.path.exists(cookies_file):
         opts["cookiefile"] = cookies_file
-    else:
-        opts["cookiesfrombrowser"] = ("chrome",)
 
     try:
         with youtube_dl.YoutubeDL(opts) as ydl:
@@ -137,7 +157,8 @@ def yt_get_video_info(url: str, cookies_file: Optional[str]) -> Optional[dict]:
             thumb = info.get("thumbnail")
             thumbs = info.get("thumbnails") or []
             if thumbs:
-                thumb = thumbs[-1].get("url") or thumb
+                jpg = next((t.get("url") for t in thumbs if (t.get("url") or "").lower().endswith(".jpg")), None)
+                thumb = jpg or thumbs[-1].get("url") or thumb
             return {
                 "title": info.get("title", ""),
                 "uploader": info.get("uploader", "") or info.get("channel", ""),
@@ -170,7 +191,7 @@ def choose_target_folder(default_name: str, base_music_dir: str) -> Optional[str
     dirs_sorted = sorted(dirs, key=str.lower)
 
     page("Куда сохранить трек?", f"[dim]{base}[/dim]")
-    table = Table(show_header=True, header_style="title")
+    table = Table(show_header=True, header_style="title", box=BOX_STYLE)
     table.add_column("#", justify="right")
     table.add_column("Подпапка")
     table.add_row("0", "⟵ Назад")
@@ -338,10 +359,9 @@ def download_audio_from_entry(track_info: dict, entry: dict, out_dir: str,
         "skip_unavailable_fragments": True, "socket_timeout": 30,
         "prefer_ipv4": True, "noplaylist": True,
     }
+    
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts["cookiefile"] = cookies_file
-    else:
-        ydl_opts["cookiesfrombrowser"] = ("chrome",)
 
     try:
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
@@ -409,7 +429,7 @@ def cli_download_single_track(
                 Prompt.ask("", default="", show_default=False)
                 return
 
-            meta = Table(show_header=False, box=None)
+            meta = Table(show_header=False, box=BOX_STYLE)
             meta.add_row("[muted]Артист:[/muted]", artist)
             meta.add_row("[muted]Название:[/muted]", title)
             meta.add_row("[muted]Альбом:[/muted]", album)
@@ -456,7 +476,7 @@ def cli_download_single_track(
                 Prompt.ask("", default="", show_default=False)
                 return
 
-            table = Table(show_header=True, header_style="title")
+            table = Table(show_header=True, header_style="title", box=BOX_STYLE)
             table.add_column("#", justify="right", style="muted")
             table.add_column("Название", style="ok")
             table.add_column("Канал", style="muted")
@@ -511,7 +531,7 @@ def cli_download_single_track(
         default_title  = title_guess  or info["title"]     or "Unknown Title"
         default_album  = info["uploader"] or "YouTube"
 
-        meta = Table(show_header=False, box=None)
+        meta = Table(show_header=False, box=BOX_STYLE)
         meta.add_row("[muted]Видео:[/muted]", info["title"])
         meta.add_row("[muted]Канал:[/muted]", info["uploader"])
         meta.add_row("[muted]Длительность:[/muted]", format_duration(info["duration"]))
